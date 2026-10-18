@@ -4,6 +4,9 @@
 五阶段：verify_existing → common → revalidate → proxy → full
 
 关键逻辑：
+  - ★ 游标每次推进 30000 个 IP（8 分片各 3750），无缝换 IP 防封禁
+  - ★ 存活 IP 明细跨批次累积：每次生成前先读取旧的 alive_ips.txt，合并去重后写回
+  - ★ 收官：游标走到末尾触发 scan_finished.flag 时，强制汇总最后一次明细，清理所有中间文件（含 artifacts），并重置游标
   - verify_existing：**替换** working_proxies.txt（只留仍有效的）
   - 其他阶段：**累积**（旧 + 新，去重）
   - common 内嵌代理验证 → 输出 proxy_ips_shardN.txt（供 revalidate 用）
@@ -12,8 +15,6 @@
   - ★ common 结束时，若有存活 IP 但 0 代理 → 直接切 full（全端口深扫）
   - 一轮完整结束 → phase.json 重置为 verify_existing（若 working_proxies.txt 非空）或 common
   - ★ 全空检测：分片文件全不存在 = 分片 job 全失败 → 不清理、不推进、trigger=yes
-  - ★ 存活 IP 段统计：一轮完整结束时生成 alive_ip_ranges.txt
-  - ★ 存活 IP 明细：一轮完整结束时生成 alive_ips.txt
 """
 
 import os
@@ -23,6 +24,7 @@ import time
 import glob
 import re
 import ipaddress
+import shutil
 
 SHARD_TOTAL = 8
 PHASE_FILE = 'phase.json'
@@ -30,6 +32,11 @@ OUTPUT_FILE = 'working_proxies.txt'
 ALIVE_IPS_FILE = 'alive_ips.txt'
 ALIVE_IP_RANGES_FILE = 'alive_ip_ranges.txt'
 CRLF = '\r\n'
+
+# ★ 游标推进大小（每次总共扫 30000 个 IP，8 分片各 3750）
+BATCH_SIZE = 30000
+CURSOR_FILE = 'scan_cursor.json'
+FINISHED_FLAG = 'scan_finished.flag'
 
 
 def log(msg):
@@ -51,6 +58,13 @@ def save_json(path, data):
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+
+def move_cursor(batch_size):
+    state = load_json(CURSOR_FILE) or {'offset': 0}
+    state['offset'] += batch_size
+    save_json(CURSOR_FILE, state)
+    log('游标已推进至: %d' % state['offset'])
 
 
 def read_shard_results(idx):
@@ -110,6 +124,15 @@ def cleanup_shard_files():
                 removed += 1
             except Exception as e:
                 log('[!] 删除 %s 失败: %s' % (path, e))
+    
+    # ★ 顺手清理 artifacts 文件夹
+    if os.path.exists('artifacts'):
+        try:
+            shutil.rmtree('artifacts', ignore_errors=True)
+            log('已清理 artifacts 目录')
+        except Exception as e:
+            log('[!] 删除 artifacts 失败: %s' % e)
+
     log('已清理 %d 个分片文件' % removed)
 
 
@@ -135,7 +158,6 @@ def _parse_ip_range(line):
     if not line or line.startswith('#') or line.startswith('@'):
         return None
     
-    # ★ 统一先提取 | 后面的归属地
     note = ''
     if '|' in line:
         parts = line.split('|', 1)
@@ -174,6 +196,21 @@ def _parse_ip_range(line):
 
 def build_alive_ip_ranges():
     alive_ints = set()
+
+    # ★ 1. 读取历史存活 IP（跨批次累积）
+    if os.path.exists(ALIVE_IPS_FILE):
+        with open(ALIVE_IPS_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('@'):
+                    continue
+                ip_str = line.split('|')[0].strip()
+                try:
+                    alive_ints.add(int(ipaddress.IPv4Address(ip_str)))
+                except Exception:
+                    pass
+
+    # ★ 2. 读取当前批次的存活 IP
     for i in range(SHARD_TOTAL):
         path = 'open_ips_shard%d.txt' % i
         if not os.path.exists(path):
@@ -196,7 +233,6 @@ def build_alive_ip_ranges():
                 if r:
                     ranges.append(r)
 
-    # ★ 生成 alive_ips.txt（明细）
     ip_to_note = {}
     for ip_int in alive_ints:
         for s, e, note in ranges:
@@ -217,9 +253,8 @@ def build_alive_ip_ranges():
                 f.write('%s|%s' % (ip_str, note) + CRLF)
             else:
                 f.write(ip_str + CRLF)
-    log('已生成 %s: %d 个存活 IP' % (ALIVE_IPS_FILE, len(alive_ints)))
+    log('已生成 %s: 累计 %d 个存活 IP' % (ALIVE_IPS_FILE, len(alive_ints)))
 
-    # 生成存活 IP 段统计
     stats = [0] * len(ranges)
     for ip_int in alive_ints:
         for idx, (s, e, note) in enumerate(ranges):
@@ -250,8 +285,7 @@ def build_alive_ip_ranges():
                 note,
             ) + CRLF)
 
-    log('已生成 %s: %d 个段有存活 IP，共 %d 存活 IP'
-        % (ALIVE_IP_RANGES_FILE, len(items), len(alive_ints)))
+    log('已生成 %s: 累计 %d 个段有存活 IP' % (ALIVE_IP_RANGES_FILE, len(items)))
 
 
 def handle_verify_existing(phase_state):
@@ -302,11 +336,30 @@ def handle_verify_existing(phase_state):
             'proxy_completed': False,
             'full_completed': False,
         })
+        move_cursor(BATCH_SIZE)
         log('phase.json 已重置为 common（自动触发下一轮）')
         set_trigger('yes')
 
 
 def main():
+    # ★ 收官逻辑：全部扫完后，做最后一次汇总，清理所有中间文件，并重置
+    if os.path.exists(FINISHED_FLAG):
+        log('=' * 60)
+        log('✅ 检测到 scan_finished.flag，全量 IP 已扫描完毕，执行最终汇总...')
+        log('=' * 60)
+        
+        try:
+            build_alive_ip_ranges()
+        except Exception as e:
+            log('[!] 最终汇总失败: %s' % e)
+
+        os.remove(FINISHED_FLAG)
+        save_json(CURSOR_FILE, {'offset': 0})
+        cleanup_shard_files()
+        set_trigger('no')
+        log('已重置游标，全部收尾工作完成。')
+        return
+
     phase_state = load_json(PHASE_FILE) or {
         'current': 'common',
         'common_completed': False,
@@ -407,7 +460,6 @@ def main():
                 trigger = 'no'
                 should_cleanup = True
             elif total_proxy_ips == 0:
-                # ★ 新增：存活但没代理，直接切 full，把存活 IP 喂给 proxy_missing 作为上游
                 log('common 完成，0 个有代理的 IP，但存活 IP 有 %d 个 → 直接切 full（深扫全端口）' % total_open)
                 for i in range(SHARD_TOTAL):
                     open_f = 'open_ips_shard%d.txt' % i
@@ -491,6 +543,7 @@ def main():
         else:
             next_phase = 'common'
             log('working_proxies.txt 为空，下一轮从头开始')
+            move_cursor(BATCH_SIZE)
 
         save_json(PHASE_FILE, {
             'current': next_phase,
