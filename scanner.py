@@ -18,6 +18,7 @@
 ★ full 前置探活：全端口前先探 COMMON_PORTS（181个），若全闭直接跳过，防止死 IP 浪费时间
 ★ 游标切片：按 BATCH_SIZE 切片，无缝换 IP 防止被防火墙封禁
 ★ 新增发包熔断：按 TOTAL_MAX_REQUESTS 限制，触发立即停止，严防高校防火墙封禁
+★ 验证诊断：verify_existing 阶段打印详细的中文失败原因，一眼看出是代理挂了、超时、还是被读秀WAF拦截
 """
 
 import os
@@ -391,7 +392,7 @@ def _text_contains_any(raw, keywords, excludes):
 def _verify_one_url(ip, port, protocol, url, keywords, excludes):
     args = _build_curl_args(ip, port, protocol, url)
     if args is None:
-        return False
+        return False, "args_error"
     verify_rate_wait()
 
     cookie_fd, cookie_path = tempfile.mkstemp(prefix='curl_cookie_', suffix='.txt')
@@ -413,11 +414,28 @@ def _verify_one_url(ip, port, protocol, url, keywords, excludes):
             '-H', 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8',
         ] + args
         proc = subprocess.run(cmd, capture_output=True, timeout=MAX_TIME + 3)
-        return _text_contains_any(proc.stdout, keywords, excludes)
+        
+        if proc.returncode != 0:
+            return False, "curl_fail_%d" % proc.returncode
+            
+        text = proc.stdout.decode('utf-8', errors='ignore')
+        if not text:
+            return False, "empty_body"
+            
+        if any(ex in text for ex in excludes):
+            return False, "blocked_by_waf"
+            
+        if any(kw in text for kw in keywords):
+            return True, "ok"
+            
+        # 如果没命中关键词，抓取前 30 个字符作为诊断
+        snippet = text[:30].replace('\n', ' ').replace('\r', ' ')
+        return False, "no_keyword: %s" % snippet
+        
     except subprocess.TimeoutExpired:
-        return False
-    except Exception:
-        return False
+        return False, "curl_timeout"
+    except Exception as e:
+        return False, "exception"
     finally:
         try:
             if os.path.exists(cookie_path):
@@ -428,19 +446,21 @@ def _verify_one_url(ip, port, protocol, url, keywords, excludes):
 
 def _verify_one_target(ip, port, protocol, target):
     for url in target['urls']:
-        if _verify_one_url(ip, port, protocol, url,
-                           target['keywords'], target.get('exclude', [])):
-            return True
-    return False
+        ok, reason = _verify_one_url(ip, port, protocol, url,
+                           target['keywords'], target.get('exclude', []))
+        if ok:
+            return True, reason
+    return False, reason
 
 
 def verify_proxy(ip, port, protocol):
     for target in VERIFY_TARGETS:
         if protocol not in target.get('protocols', []):
             continue
-        if not _verify_one_target(ip, port, protocol, target):
-            return False
-    return True
+        ok, reason = _verify_one_target(ip, port, protocol, target)
+        if not ok:
+            return False, reason
+    return True, "ok"
 
 
 def scan_port_common(ip, port):
@@ -452,7 +472,8 @@ def scan_port_full(ip, port):
         return False, []
     working = []
     for proto in PROTOCOLS:
-        if verify_proxy(ip, port, proto):
+        ok, _ = verify_proxy(ip, port, proto)
+        if ok:
             working.append((ip, port, proto))
     return True, working
 
@@ -487,6 +508,31 @@ def _skip_this_shard(state_file, output_filter_file, phase, ports_count):
                 pass
         except Exception:
             pass
+
+
+def _translate_reason(reason):
+    if not reason:
+        return "未知"
+    if reason.startswith('curl_fail_7'):
+        return "连接失败(代理已死或端口关闭)"
+    if reason.startswith('curl_fail_28') or reason == 'curl_timeout':
+        return "连接超时(代理半死或网络极慢)"
+    if reason.startswith('curl_fail_56'):
+        return "连接被重置(可能被中间网关拦截)"
+    if reason.startswith('curl_fail_35'):
+        return "SSL握手失败(代理不支持CONNECT)"
+    if reason.startswith('curl_fail_'):
+        return "网络错误(错误码:%s)" % reason.split('_')[-1]
+    if reason == 'blocked_by_waf':
+        return "命中安全验证(被读秀WAF风控拦截)"
+    if reason == 'empty_body':
+        return "返回内容为空(可能被反爬拦截)"
+    if reason.startswith('no_keyword:'):
+        snippet = reason.split(':', 1)[1].strip()
+        return "页面无关键词(可能改版或被劫持) [%s...]" % snippet
+    if reason == 'args_error':
+        return "代理协议配置错误"
+    return reason
 
 
 def run_verify_existing_phase():
@@ -526,7 +572,7 @@ def run_verify_existing_phase():
 
     def verify_one(item):
         ip, port, proto, note = item
-        ok = verify_proxy(ip, port, proto)
+        ok, reason = verify_proxy(ip, port, proto)
         with found_lock:
             checked_count[0] += 1
             n = checked_count[0]
@@ -540,7 +586,8 @@ def run_verify_existing_phase():
                     f.write(line_out + CRLF)
                 log('[+] 仍然有效: %s' % line_out)
             else:
-                log('[-] 已失效: %s:%d@%s' % (ip, port, proto))
+                cn_reason = _translate_reason(reason)
+                log('[-] 已失效: %s:%d@%s (原因: %s)' % (ip, port, proto, cn_reason))
             if n % 20 == 0:
                 elapsed = time.time() - t0
                 log('[verify_existing] 已检查 %d/%d | 有效 %d | %.1f s'
