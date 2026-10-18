@@ -6,9 +6,9 @@
 关键逻辑：
   - verify_existing：**替换** working_proxies.txt（只留仍有效的）
   - 其他阶段：**累积**（旧 + 新，去重）
-  - ★ 游标切片与防封禁：游标每次推进 30000 个 IP（8 分片各 3750），无缝换 IP 防止被封禁
+  - ★ 游标切片与防封禁：游标每次推进 BATCH_SIZE 个 IP（默认 30000），无缝换 IP 防止被封禁
   - ★ 跨批次累积：存活 IP 明细（alive_ips.txt）每次生成前读取旧的并合并去重，确保历史存活 IP 不丢失
-  - ★ 【核心】common 阶段扫完：无论有无代理，一律推进游标（+30000），保持 common 阶段，继续扫下一批
+  - ★ 【核心】common 阶段扫完：无论有无代理，一律推进游标（+ BATCH_SIZE），保持 common 阶段，继续扫下一批
       - 防死循环：如果游标推进后或当前游标已经大于总IP数，直接收官，不触发下一轮
   - ★ 【核心】全量扫完后的分流：游标走到尽头（触发 scan_finished.flag）时：
       - 若已扫出代理，直接收官（省去全端口扫描）
@@ -25,6 +25,14 @@ import re
 import ipaddress
 import shutil
 
+# ============ 核心调度参数（每次换学校请根据需要修改） ============
+# 每次触发 Actions 扫描的总 IP 数量（与 scanner.py 保持一致）
+BATCH_SIZE = 30000
+
+# 全局总探活次数熔断限额（与 scanner.py 保持一致，此处只用于日志展示或备用，实际熔断在 scanner.py 中执行）
+TOTAL_MAX_REQUESTS = 5500000
+# ===============================================================
+
 SHARD_TOTAL = 8
 PHASE_FILE = 'phase.json'
 OUTPUT_FILE = 'working_proxies.txt'
@@ -32,7 +40,6 @@ ALIVE_IPS_FILE = 'alive_ips.txt'
 ALIVE_IP_RANGES_FILE = 'alive_ip_ranges.txt'
 CRLF = '\r\n'
 
-BATCH_SIZE = 30000
 CURSOR_FILE = 'scan_cursor.json'
 FINISHED_FLAG = 'scan_finished.flag'
 
@@ -509,7 +516,7 @@ def main():
             cursor_state = load_json(CURSOR_FILE) or {'offset': 0}
             current_offset = cursor_state.get('offset', 0)
             
-            # 如果当前游标加 30000 已经大于总数，或者当前游标本身就大于总数了
+            # 如果当前游标加 BATCH_SIZE 已经大于总数，或者当前游标本身就大于总数了
             if current_offset >= all_ips_flat_count:
                 log('游标 %d >= 总IP数 %d，全量扫描已完毕，直接收官！' % (current_offset, all_ips_flat_count))
                 save_json(CURSOR_FILE, {'offset': 0})
