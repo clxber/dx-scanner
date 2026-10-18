@@ -515,7 +515,6 @@ jobs:
         id: check_cancel
         if: always()
         run: |
-          # 只要有一个分片是 cancelled，就认定是手动取消
           if [ "${{ needs.shard-0.result }}" = "cancelled" ] || [ "${{ needs.shard-1.result }}" = "cancelled" ] || [ "${{ needs.shard-7.result }}" = "cancelled" ]; then
             echo "is_cancelled=true" >> $GITHUB_OUTPUT
             echo "⚠️ 检测到分片被手动取消，将执行清理。"
@@ -537,7 +536,6 @@ jobs:
           git diff --staged --quiet || git commit -m "手动取消扫描，清理残留 [skip ci]"
           git push || true
 
-      # 如果被取消，后续步骤全部跳过
       - name: 下载 shard-0 artifact
         if: always() && steps.check_cancel.outputs.is_cancelled == 'false'
         continue-on-error: true
@@ -586,7 +584,9 @@ jobs:
             for f in artifacts/*; do
               [ -f "$f" ] || continue
               base=$(basename "$f")
-              [ ! -f "$base" ] && cp "$f" "$base"
+              if [ ! -f "$base" ]; then
+                cp "$f" "$base"
+              fi
             done
           fi
 
