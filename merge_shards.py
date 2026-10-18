@@ -6,17 +6,10 @@
 关键逻辑：
   - verify_existing：**替换** working_proxies.txt（只留仍有效的）
   - 其他阶段：**累积**（旧 + 新，去重）
-  - common 内嵌代理验证 → 输出 proxy_ips_shardN.txt（供 revalidate 用）
-  - revalidate 只对 proxy_ips_shardN.txt 里的 IP 二次探活
-  - proxy 找到 ≥1 条记录 → 跳过 full（节约原则）
-  - 一轮完整结束 → phase.json 重置为 verify_existing（若 working_proxies.txt 非空）或 common
-  - ★ 全空检测：分片文件全不存在 = 分片 job 全失败 → 不清理、不推进、trigger=yes
-  - ★ 存活 IP 段统计：一轮完整结束时生成 alive_ip_ranges.txt
-  - ★ 存活 IP 明细：一轮完整结束时生成 alive_ips.txt
-
   - ★ 游标切片与防封禁：游标每次推进 30000 个 IP（8 分片各 3750），无缝换 IP 防止被封禁
   - ★ 跨批次累积：存活 IP 明细（alive_ips.txt）每次生成前读取旧的并合并去重，确保历史存活 IP 不丢失
   - ★ 【核心】common 阶段扫完：无论有无代理，一律推进游标（+30000），保持 common 阶段，继续扫下一批
+      - 防死循环：如果游标推进后或当前游标已经大于总IP数，直接收官，不触发下一轮
   - ★ 【核心】全量扫完后的分流：游标走到尽头（触发 scan_finished.flag）时：
       - 若已扫出代理，直接收官（省去全端口扫描）
       - 若 0 代理，读取全局累积的 alive_ips.txt，均分给 8 个分片，统一切换到 full 阶段进行全端口深扫
@@ -504,19 +497,38 @@ def main():
         trigger = 'yes'
     else:
         if current_phase == 'common':
-            # ★ 核心改动：common 跑完，无论死活，直接推进游标，扫下一批
-            log('common 阶段完成，存活 IP %d，有代理的 IP %d → 暂存存活 IP，推进游标开启下一批' % (total_open, total_proxy_ips))
-            try:
-                build_alive_ip_ranges()
-            except Exception as e:
-                log('[!] 暂存存活 IP 失败: %s' % e)
+            # ★ 核心修复：先判断游标是否已经到底了（防呆防死循环）
+            all_ips_flat_count = 0
+            if os.path.exists('ip_list.txt'):
+                with open('ip_list.txt', 'r', encoding='utf-8-sig', errors='ignore') as f:
+                    for line in f:
+                        r = _parse_ip_range(line)
+                        if r:
+                            all_ips_flat_count += (r[1] - r[0] + 1)
             
-            move_cursor(BATCH_SIZE)
-            phase_state['current'] = 'common'
-            save_json(PHASE_FILE, phase_state)
+            cursor_state = load_json(CURSOR_FILE) or {'offset': 0}
+            current_offset = cursor_state.get('offset', 0)
             
-            cleanup_shard_files()
-            trigger = 'yes'
+            # 如果当前游标加 30000 已经大于总数，或者当前游标本身就大于总数了
+            if current_offset >= all_ips_flat_count:
+                log('游标 %d >= 总IP数 %d，全量扫描已完毕，直接收官！' % (current_offset, all_ips_flat_count))
+                save_json(CURSOR_FILE, {'offset': 0})
+                cleanup_shard_files()
+                trigger = 'no'
+                should_cleanup = True
+            else:
+                log('common 阶段完成，存活 IP %d，有代理的 IP %d → 暂存存活 IP，推进游标开启下一批' % (total_open, total_proxy_ips))
+                try:
+                    build_alive_ip_ranges()
+                except Exception as e:
+                    log('[!] 暂存存活 IP 失败: %s' % e)
+                
+                move_cursor(BATCH_SIZE)
+                phase_state['current'] = 'common'
+                save_json(PHASE_FILE, phase_state)
+                
+                cleanup_shard_files()
+                trigger = 'yes'
 
         elif current_phase == 'revalidate':
             if total_rev == 0:
