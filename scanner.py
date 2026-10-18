@@ -52,12 +52,9 @@ VERIFY_TARGETS = [
 
 MAX_RUNTIME_SEC = int(os.environ.get('MAX_RUNTIME_SEC', 20880))
 
-# ★ 每次扫描的批次大小（8 分片各 3750 IP，总共 30000 IP）
 BATCH_SIZE = 30000
 CURSOR_FILE = 'scan_cursor.json'
 FINISHED_FLAG = 'scan_finished.flag'
-
-# ★ 发包熔断配置：全局 550 万次，8 个分片均摊，每个分片 68.75 万次
 TOTAL_MAX_REQUESTS = 5500000
 
 
@@ -110,7 +107,6 @@ args, _ = parser.parse_known_args()
 SHARD_INDEX = args.shard
 SHARD_TOTAL = args.shard_total
 
-# 每个分片分配的发包限额
 SHARD_MAX_REQUESTS = TOTAL_MAX_REQUESTS // SHARD_TOTAL if SHARD_TOTAL > 0 else TOTAL_MAX_REQUESTS
 
 TCP_TIMEOUT = 1.0
@@ -699,12 +695,37 @@ def main():
 
     start_position = state['position']
 
+    # ★ 读取全局累积数据，用于日志展示
+    history_alive_count = 0
+    if os.path.exists('alive_ips.txt'):
+        try:
+            with open('alive_ips.txt', 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if line.strip() and not line.startswith('@'):
+                        history_alive_count += 1
+        except Exception:
+            pass
+            
+    global_proxy_count = 0
+    if os.path.exists('working_proxies.txt'):
+        try:
+            with open('working_proxies.txt', 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if line.strip() and not line.startswith('@'):
+                        global_proxy_count += 1
+        except Exception:
+            pass
+
     log('本片 IP 总数: %d' % total_ips)
     log('端口数: %d' % len(PORTS))
     if current_phase in ('common', 'revalidate'):
         log('  前 12 探针: %s' % PROBE_PORTS_12)
-    log('本次起点: IP #%d' % state['position'])
-    log('已找到代理: %d' % len(existing))
+    
+    # ★ 日志展示全量视角
+    log('本次起点: 本片 IP #%d (全局游标 #%d / 总 %d)' % (state['position'], current_offset, total_all_ips))
+    log('已找到代理: 全局累积 %d 个 | 本片已有 %d 个' % (global_proxy_count, len(existing)))
+    log('历史存活 IP 累积: %d 个' % history_alive_count)
+    
     log('搜索连接超时: %s s | 验证超时: %d s' % (TCP_TIMEOUT, VERIFY_TIMEOUT))
     log('IP 并发: %d  ×  端口并发: %d  =  全局最大 %d 条连接'
         % (TCP_WORKERS, PORT_WORKERS, TCP_WORKERS * PORT_WORKERS))
@@ -923,7 +944,7 @@ def main():
                         pf = len(proxy_found_ips)
                         pm = len(proxy_missing_ips)
                     if current_phase == 'common':
-                        extra = '存活 %d | 代理IP %d' % (oc, pc)
+                        extra = '存活 %d (累计 %d) | 代理IP %d (累计 %d)' % (oc, history_alive_count + oc, pc, global_proxy_count + found_count[0] - len(existing) + pc)
                     elif current_phase == 'revalidate':
                         extra = '重验存活 %d' % rc
                     elif current_phase == 'proxy':
