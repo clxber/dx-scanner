@@ -10,9 +10,10 @@
 阶段 5 full           ：65535 全端口（只扫 proxy 未找到代理的 IP）
 验证：单验证 —— 读秀（https://www.duxiu.com/），命中「读秀学术搜索」才算有效代理
 代理协议：http / socks5 / socks4（已去掉 https）
-★ 宇宙极限版：TCP_TIMEOUT=1.0，CONNECT_TIMEOUT=15，MAX_TIME=30
-★ 极限并发：80×25 = 2000 并发
+★ 终极定版：TCP_TIMEOUT=1.0，CONNECT_TIMEOUT=15，MAX_TIME=30
+★ 极限并发：80×25 = 2000 并发（实测 2500 task/s）
 ★ 彻底取消验证限速（VERIFY_RATE_LIMIT=0），且内嵌验证并发，解决串行卡 35 分钟的问题
+★ full 前置探活：全端口前先探 COMMON_PORTS（181个），若全闭直接跳过
 """
 
 import os
@@ -32,11 +33,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ============ 配置 ============
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 
-# ★ curl 超时
 CONNECT_TIMEOUT = 15
 MAX_TIME = 30
 
-# ★ 单验证：只测读秀
 VERIFY_TARGETS = [
     {
         'name': 'duxiu',
@@ -100,17 +99,13 @@ args, _ = parser.parse_known_args()
 SHARD_INDEX = args.shard
 SHARD_TOTAL = args.shard_total
 
-# ★ 极限速度 1.0 秒
 TCP_TIMEOUT = 1.0
 VERIFY_TIMEOUT = 30
 VERIFY_RETRY = 0
 VERIFY_DELAY = 0.0
-# ★ 宇宙极限并发 80×25 = 2000
 TCP_WORKERS = 80
 PORT_WORKERS = 25
 IP_COOLDOWN = 0.5
-
-# ★ 彻底取消全局限速
 VERIFY_RATE_LIMIT = 0
 
 INPUT_FILE = 'ip_list.txt'
@@ -137,8 +132,6 @@ EXISTING_PROXIES_FILE = 'working_proxies.txt'
 ALIVE_IP_RANGES_FILE = 'alive_ip_ranges.txt'
 
 CURL = shutil.which('curl') or 'curl'
-
-# ★ 去掉 https 协议，只保留 http / socks5 / socks4
 PROTOCOLS = ('http', 'socks5', 'socks4')
 
 
@@ -173,32 +166,40 @@ def _valid_ipv4(s):
 
 def parse_ip_range(line):
     line = line.strip()
-    if not line or line.startswith('#'):
+    if not line or line.startswith('#') or line.startswith('@'):
         return None
+    
+    # ★ 统一先提取 | 后面的归属地
+    note = ''
+    if '|' in line:
+        parts = line.split('|', 1)
+        line = parts[0].strip()
+        note = _clean_note(parts[1])
+
     for tok in line.split():
         if '/' in tok:
             try:
                 net = ipaddress.ip_network(tok, strict=False)
                 if net.version != 4:
                     continue
-                return int(net.network_address), int(net.broadcast_address), ''
+                return int(net.network_address), int(net.broadcast_address), note
             except Exception:
                 pass
+                
     m = QQWRY_RANGE_RE.search(line)
     if m:
         a, b = m.group(1), m.group(2)
         if _valid_ipv4(a) and _valid_ipv4(b):
             sa = int(ipaddress.IPv4Address(a))
             sb = int(ipaddress.IPv4Address(b))
-            note = ''
-            if '|' in line:
-                note = _clean_note(line.split('|', 1)[1])
             return min(sa, sb), max(sa, sb), note
+            
     m = SINGLE_IP_RE.search(line)
     if m:
         a = m.group(1)
         if _valid_ipv4(a):
-            return int(ipaddress.IPv4Address(a)), int(ipaddress.IPv4Address(a)), ''
+            return int(ipaddress.IPv4Address(a)), int(ipaddress.IPv4Address(a)), note
+            
     return None
 
 
@@ -311,7 +312,6 @@ _rate_last = [0.0]
 
 
 def verify_rate_wait():
-    # ★ VERIFY_RATE_LIMIT = 0 时直接返回，不进行任何限速
     if VERIFY_RATE_LIMIT <= 0:
         return
     min_interval = 1.0 / VERIFY_RATE_LIMIT
@@ -412,9 +412,6 @@ def _verify_one_target(ip, port, protocol, target):
 
 
 def verify_proxy(ip, port, protocol):
-    """
-    ★ 单验证：读秀
-    """
     for target in VERIFY_TARGETS:
         if protocol not in target.get('protocols', []):
             continue
@@ -502,8 +499,6 @@ def _skip_this_shard(state_file, output_filter_file, phase, ports_count):
             pass
 
 
-# ============ verify_existing 阶段 ============
-
 def run_verify_existing_phase():
     if SHARD_INDEX != 0:
         log('[verify_existing] 分片 %d 跳过（只有分片 0 做验证）' % SHARD_INDEX)
@@ -590,8 +585,6 @@ def run_verify_existing_phase():
     }
     save_json(STATE_FILE, state)
 
-
-# ============ main ============
 
 def main():
     if not os.path.exists(INPUT_FILE):
@@ -717,7 +710,6 @@ def main():
     log('验证协议: %s（不短路，全试）' % (', '.join(PROTOCOLS)))
     log('curl 超时: 连接 %d s / 总 %d s' % (CONNECT_TIMEOUT, MAX_TIME))
     
-    # ★ 限速日志详细化
     if VERIFY_RATE_LIMIT > 0:
         log('全局限速: %d 次/秒（全局串行排队控制）' % VERIFY_RATE_LIMIT)
     else:
@@ -771,6 +763,24 @@ def main():
             ip_has_proxy = False
             ip_open_count = 0
             ip_proxy_count = 0
+
+            # ★ 新增：full 阶段前置探活（181端口），如果全闭则直接跳过
+            if current_phase == 'full':
+                ip_alive = False
+                probe_futures = [port_pool.submit(tcp_check, ip, port) for port in COMMON_PORTS]
+                for pf in as_completed(probe_futures):
+                    if pf.result():
+                        ip_alive = True
+                        break
+                if not ip_alive:
+                    with found_lock:
+                        processed_ips[0] += 1
+                        real_done = start_position + processed_ips[0]
+                        pct = real_done * 100.0 / total_ips if total_ips else 0
+                        elapsed = time.time() - t0
+                        log('[full] IP %s 探活失败 (181端口全闭)，跳过全端口 | 全局 %d/%d (%.2f%%) | %.0f s'
+                            % (ip, real_done, total_ips, pct, elapsed))
+                    continue
 
             futures = []
             for port in PORTS:
@@ -826,7 +836,6 @@ def main():
                 if short_circuit and ip_has_open:
                     break
 
-            # ★ 关键修复：把内嵌代理验证改为并发，不再串行死等
             if current_phase == 'common' and ip_has_open:
                 verify_futures = []
                 for port in PROXY_PORTS:
