@@ -12,6 +12,7 @@
   - 一轮完整结束 → phase.json 重置为 verify_existing（若 working_proxies.txt 非空）或 common
   - ★ 全空检测：分片文件全不存在 = 分片 job 全失败 → 不清理、不推进、trigger=yes
   - ★ 存活 IP 段统计：一轮完整结束时生成 alive_ip_ranges.txt
+  - ★ 存活 IP 明细：一轮完整结束时生成 alive_ips.txt
 """
 
 import os
@@ -25,6 +26,7 @@ import ipaddress
 SHARD_TOTAL = 8
 PHASE_FILE = 'phase.json'
 OUTPUT_FILE = 'working_proxies.txt'
+ALIVE_IPS_FILE = 'alive_ips.txt'
 ALIVE_IP_RANGES_FILE = 'alive_ip_ranges.txt'
 CRLF = '\r\n'
 
@@ -78,7 +80,6 @@ def read_file_lines(path):
 
 
 def proxy_key(line):
-    """key 是 ip:port@proto，支持同一 IP:端口多协议（http/https/socks5/socks4）"""
     if '@' not in line:
         return line
     parts = line.split('@')
@@ -95,7 +96,7 @@ def cleanup_shard_files():
     patterns = [
         'progress_shard*.json',
         'open_ips_shard*.txt',
-        'proxy_ips_shard*.txt',           # ★ 新增
+        'proxy_ips_shard*.txt',
         'open_ips_revalidated_shard*.txt',
         'proxy_missing_shard*.txt',
         'working_proxies_shard*.txt',
@@ -129,43 +130,48 @@ def set_trigger(value):
 
 
 def _parse_ip_range(line):
-    """简化版 IP 段解析（和 scanner.py 一致）"""
     line = line.strip()
-    if not line or line.startswith('#'):
+    if not line or line.startswith('#') or line.startswith('@'):
         return None
+    
+    # ★ 统一先提取 | 后面的归属地
+    note = ''
+    if '|' in line:
+        parts = line.split('|', 1)
+        line = parts[0].strip()
+        note = parts[1].strip()
+
     for tok in line.split():
         if '/' in tok:
             try:
                 net = ipaddress.ip_network(tok, strict=False)
                 if net.version != 4:
                     continue
-                return int(net.network_address), int(net.broadcast_address), ''
+                return int(net.network_address), int(net.broadcast_address), note
             except Exception:
                 pass
+
     m = re.search(r'(\d{1,3}(?:\.\d{1,3}){3})\s*-\s*(\d{1,3}(?:\.\d{1,3}){3})', line)
     if m:
         a, b = m.group(1), m.group(2)
         try:
             sa = int(ipaddress.IPv4Address(a))
             sb = int(ipaddress.IPv4Address(b))
-            note = ''
-            if '|' in line:
-                note = line.split('|', 1)[1].strip()
             return min(sa, sb), max(sa, sb), note
         except Exception:
             pass
+            
     m = re.search(r'(\d{1,3}(?:\.\d{1,3}){3})', line)
     if m:
         try:
             a = int(ipaddress.IPv4Address(m.group(1)))
-            return a, a, ''
+            return a, a, note
         except Exception:
             pass
     return None
 
 
 def build_alive_ip_ranges():
-    """生成 alive_ip_ranges.txt —— 存活 IP 按段统计，按存活数降序"""
     alive_ints = set()
     for i in range(SHARD_TOTAL):
         path = 'open_ips_shard%d.txt' % i
@@ -189,6 +195,30 @@ def build_alive_ip_ranges():
                 if r:
                     ranges.append(r)
 
+    # ★ 生成 alive_ips.txt（明细）
+    ip_to_note = {}
+    for ip_int in alive_ints:
+        for s, e, note in ranges:
+            if s <= ip_int <= e:
+                ip_to_note[ip_int] = note
+                break
+
+    with open(ALIVE_IPS_FILE, 'w', encoding='utf-8', newline='') as f:
+        f.write('@ 存活 IP 明细' + CRLF)
+        f.write('@ 生成时间: %s' % time.strftime('%Y-%m-%d %H:%M:%S') + CRLF)
+        f.write('@ 存活 IP 总数: %d' % len(alive_ints) + CRLF)
+        f.write('@ 格式: IP|归属地' + CRLF)
+        f.write('@' + '-' * 58 + CRLF)
+        for ip_int in sorted(alive_ints):
+            ip_str = str(ipaddress.IPv4Address(ip_int))
+            note = ip_to_note.get(ip_int, '')
+            if note:
+                f.write('%s|%s' % (ip_str, note) + CRLF)
+            else:
+                f.write(ip_str + CRLF)
+    log('已生成 %s: %d 个存活 IP' % (ALIVE_IPS_FILE, len(alive_ints)))
+
+    # 生成存活 IP 段统计
     stats = [0] * len(ranges)
     for ip_int in alive_ints:
         for idx, (s, e, note) in enumerate(ranges):
@@ -289,7 +319,6 @@ def main():
         handle_verify_existing(phase_state)
         return
 
-    # ★ 全空检测（加 proxy_ips_shard*）
     has_any_shard_file = any(
         os.path.exists('working_proxies_shard%d.txt' % i) or
         os.path.exists('progress_shard%d.json' % i) or
@@ -435,12 +464,12 @@ def main():
 
     if should_cleanup:
         log('=' * 60)
-        log('一轮完整结束，生成存活 IP 段统计 + 清理分片文件...')
+        log('一轮完整结束，生成存活 IP 明细及段统计 + 清理分片文件...')
 
         try:
             build_alive_ip_ranges()
         except Exception as e:
-            log('[!] 生成 %s 失败: %s' % (ALIVE_IP_RANGES_FILE, e))
+            log('[!] 生成存活 IP 文件失败: %s' % e)
 
         cleanup_shard_files()
 
