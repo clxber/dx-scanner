@@ -540,6 +540,7 @@ jobs:
           rm -f proxy_missing_shard*.txt
           rm -f working_proxies_shard*.txt
           rm -f phase.json
+          rm -f alive_ips.txt
           git add -A
           git diff --staged --quiet || git commit -m "手动取消扫描，清理残留 [skip ci]"
           git push || true
@@ -638,3 +639,4 @@ jobs:
             working_proxies.txt
             phase.json
             alive_ip_ranges.txt
+            alive_ips.txt
