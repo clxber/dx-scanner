@@ -16,8 +16,8 @@
 ★ 极限并发：80×25 = 2000 并发（实测 2500 task/s）
 ★ 彻底取消验证限速（VERIFY_RATE_LIMIT=0），且内嵌验证并发，解决串行卡 35 分钟的问题
 ★ full 前置探活：全端口前先探 COMMON_PORTS（181个），若全闭直接跳过，防止死 IP 浪费时间
-★ 游标切片：每次总共 30000 个 IP（8 分片各 3750），无缝换 IP 防止被防火墙封禁
-★ 新增发包熔断：单分片探活达到 68.75 万次（全局 550 万次）立即停止，无缝换 IP，严防高校防火墙封禁
+★ 游标切片：按 BATCH_SIZE 切片，无缝换 IP 防止被防火墙封禁
+★ 新增发包熔断：按 TOTAL_MAX_REQUESTS 限制，触发立即停止，严防高校防火墙封禁
 """
 
 import os
@@ -33,6 +33,18 @@ import subprocess
 import ipaddress
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ============ 核心调度参数（每次换学校请根据需要修改） ============
+# 每次触发 Actions 扫描的总 IP 数量（会自动均分给 8 个分片，如 30000 即每分片 3750 个）
+BATCH_SIZE = 30000
+
+# 全局总探活次数熔断限额（单分片限额 = TOTAL_MAX_REQUESTS / 8，如 5500000 即单分片 687500 次）
+# 如果学校防火墙容易封，可以调小；如果一直没被封且速度很快，可以调大。
+TOTAL_MAX_REQUESTS = 5500000
+# ===============================================================
+
+CURSOR_FILE = 'scan_cursor.json'
+FINISHED_FLAG = 'scan_finished.flag'
 
 # ============ 配置 ============
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -51,12 +63,6 @@ VERIFY_TARGETS = [
 ]
 
 MAX_RUNTIME_SEC = int(os.environ.get('MAX_RUNTIME_SEC', 20880))
-
-BATCH_SIZE = 30000
-CURSOR_FILE = 'scan_cursor.json'
-FINISHED_FLAG = 'scan_finished.flag'
-TOTAL_MAX_REQUESTS = 5500000
-
 
 def _build_probe_ports_12():
     return [22, 80, 443, 3389, 1080, 1081, 8080, 8081, 7890, 3128, 8000, 8443]
