@@ -36,6 +36,7 @@ jobs:
           python scanner.py --shard 0 --shard-total 8
       - name: 上传本分片 Artifact（第一优先级，先保住数据）
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: shard-0-files
@@ -98,6 +99,7 @@ jobs:
           python scanner.py --shard 1 --shard-total 8
       - name: 上传本分片 Artifact（第一优先级，先保住数据）
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: shard-1-files
@@ -160,6 +162,7 @@ jobs:
           python scanner.py --shard 2 --shard-total 8
       - name: 上传本分片 Artifact（第一优先级，先保住数据）
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: shard-2-files
@@ -222,6 +225,7 @@ jobs:
           python scanner.py --shard 3 --shard-total 8
       - name: 上传本分片 Artifact（第一优先级，先保住数据）
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: shard-3-files
@@ -284,6 +288,7 @@ jobs:
           python scanner.py --shard 4 --shard-total 8
       - name: 上传本分片 Artifact（第一优先级，先保住数据）
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: shard-4-files
@@ -346,6 +351,7 @@ jobs:
           python scanner.py --shard 5 --shard-total 8
       - name: 上传本分片 Artifact（第一优先级，先保住数据）
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: shard-5-files
@@ -408,6 +414,7 @@ jobs:
           python scanner.py --shard 6 --shard-total 8
       - name: 上传本分片 Artifact（第一优先级，先保住数据）
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: shard-6-files
@@ -470,6 +477,7 @@ jobs:
           python scanner.py --shard 7 --shard-total 8
       - name: 上传本分片 Artifact（第一优先级，先保住数据）
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: shard-7-files
