@@ -1,7 +1,7 @@
 {
-  "current": "revalidate",
+  "current": "proxy",
   "common_completed": true,
-  "revalidate_completed": false,
+  "revalidate_completed": true,
   "proxy_completed": false,
   "full_completed": false
 }
