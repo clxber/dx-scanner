@@ -515,7 +515,14 @@ jobs:
         id: check_cancel
         if: always()
         run: |
-          if [ "${{ needs.shard-0.result }}" = "cancelled" ] || [ "${{ needs.shard-1.result }}" = "cancelled" ] || [ "${{ needs.shard-7.result }}" = "cancelled" ]; then
+          if [ "${{ needs.shard-0.result }}" = "cancelled" ] || \
+             [ "${{ needs.shard-1.result }}" = "cancelled" ] || \
+             [ "${{ needs.shard-2.result }}" = "cancelled" ] || \
+             [ "${{ needs.shard-3.result }}" = "cancelled" ] || \
+             [ "${{ needs.shard-4.result }}" = "cancelled" ] || \
+             [ "${{ needs.shard-5.result }}" = "cancelled" ] || \
+             [ "${{ needs.shard-6.result }}" = "cancelled" ] || \
+             [ "${{ needs.shard-7.result }}" = "cancelled" ]; then
             echo "is_cancelled=true" >> $GITHUB_OUTPUT
             echo "⚠️ 检测到分片被手动取消，将执行清理。"
           else
@@ -532,6 +539,7 @@ jobs:
           rm -f open_ips_revalidated_shard*.txt
           rm -f proxy_missing_shard*.txt
           rm -f working_proxies_shard*.txt
+          rm -f phase.json
           git add -A
           git diff --staged --quiet || git commit -m "手动取消扫描，清理残留 [skip ci]"
           git push || true
