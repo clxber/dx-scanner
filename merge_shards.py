@@ -9,6 +9,7 @@
   - common 内嵌代理验证 → 输出 proxy_ips_shardN.txt（供 revalidate 用）
   - revalidate 只对 proxy_ips_shardN.txt 里的 IP 二次探活
   - proxy 找到 ≥1 条记录 → 跳过 full（节约原则）
+  - ★ common 结束时，若有存活 IP 但 0 代理 → 直接切 full（全端口深扫）
   - 一轮完整结束 → phase.json 重置为 verify_existing（若 working_proxies.txt 非空）或 common
   - ★ 全空检测：分片文件全不存在 = 分片 job 全失败 → 不清理、不推进、trigger=yes
   - ★ 存活 IP 段统计：一轮完整结束时生成 alive_ip_ranges.txt
@@ -406,14 +407,23 @@ def main():
                 trigger = 'no'
                 should_cleanup = True
             elif total_proxy_ips == 0:
-                log('common 完成，0 个有代理的 IP → 结束（无代理可深验）')
+                # ★ 新增：存活但没代理，直接切 full，把存活 IP 喂给 proxy_missing 作为上游
+                log('common 完成，0 个有代理的 IP，但存活 IP 有 %d 个 → 直接切 full（深扫全端口）' % total_open)
+                for i in range(SHARD_TOTAL):
+                    open_f = 'open_ips_shard%d.txt' % i
+                    missing_f = 'proxy_missing_shard%d.txt' % i
+                    if os.path.exists(open_f):
+                        with open(open_f, 'r', encoding='utf-8', errors='ignore') as f_in:
+                            lines = [line.strip() for line in f_in if line.strip()]
+                        with open(missing_f, 'w', encoding='utf-8', newline='') as f_out:
+                            for line in lines:
+                                f_out.write(line + CRLF)
+                phase_state['current'] = 'full'
                 phase_state['common_completed'] = True
                 phase_state['revalidate_completed'] = True
                 phase_state['proxy_completed'] = True
-                phase_state['full_completed'] = True
                 save_json(PHASE_FILE, phase_state)
-                trigger = 'no'
-                should_cleanup = True
+                trigger = 'yes'
             else:
                 log('common 完成，%d 存活 IP / %d 有代理的 IP → 切 revalidate（只验有代理的 IP）'
                     % (total_open, total_proxy_ips))
