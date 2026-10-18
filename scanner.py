@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 高校代理扫描器 —— 五阶段 + 分片 + 断点续跑
+
 阶段 1 verify_existing：验证已有代理（只有分片 0 干活）
 阶段 2 common         ：12 探针 + 177 代理（TCP 探活，IP 级短路）+ 顺便代理验证
                         → 输出 open_ips_shardN.txt（所有存活 IP）
@@ -8,12 +9,15 @@
 阶段 3 revalidate     ：对 proxy_ips_shardN.txt（有代理的 IP）二次探活
 阶段 4 proxy          ：177 代理端口（完整扫描 + 单验证，3 协议全试）
 阶段 5 full           ：65535 全端口（只扫 proxy 未找到代理的 IP）
+
 验证：单验证 —— 读秀（https://www.duxiu.com/），命中「读秀学术搜索」才算有效代理
 代理协议：http / socks5 / socks4（已去掉 https）
 ★ 终极定版：TCP_TIMEOUT=1.0，CONNECT_TIMEOUT=15，MAX_TIME=30
 ★ 极限并发：80×25 = 2000 并发（实测 2500 task/s）
 ★ 彻底取消验证限速（VERIFY_RATE_LIMIT=0），且内嵌验证并发，解决串行卡 35 分钟的问题
-★ full 前置探活：全端口前先探 COMMON_PORTS（181个），若全闭直接跳过
+★ full 前置探活：全端口前先探 COMMON_PORTS（181个），若全闭直接跳过，防止死 IP 浪费时间
+★ 游标切片：每次总共 30000 个 IP（8 分片各 3750），无缝换 IP 防止被防火墙封禁
+★ 新增发包熔断：单分片探活达到 68.75 万次（全局 550 万次）立即停止，无缝换 IP，严防高校防火墙封禁
 """
 
 import os
@@ -48,6 +52,14 @@ VERIFY_TARGETS = [
 
 MAX_RUNTIME_SEC = int(os.environ.get('MAX_RUNTIME_SEC', 20880))
 
+# ★ 每次扫描的批次大小（8 分片各 3750 IP，总共 30000 IP）
+BATCH_SIZE = 30000
+CURSOR_FILE = 'scan_cursor.json'
+FINISHED_FLAG = 'scan_finished.flag'
+
+# ★ 发包熔断配置：全局 550 万次，8 个分片均摊，每个分片 68.75 万次
+TOTAL_MAX_REQUESTS = 5500000
+
 
 def _build_probe_ports_12():
     return [22, 80, 443, 3389, 1080, 1081, 8080, 8081, 7890, 3128, 8000, 8443]
@@ -60,7 +72,6 @@ def _build_proxy_ports():
         (10000, 10010), (10080, 10086), (3128, 3130), (8388, 8389),
         (8443, 8444), (2052, 2096), (51820, 51830), (1194, 1199),
         (9050, 9051), (9150, 9151),
-        # ★ 根据真实代理列表，新增独立端口
         (15732, 15732), (26001, 26001), (29290, 29290),
         (10090, 10090), (17891, 17891), (10792, 10792),
     ]
@@ -98,6 +109,9 @@ args, _ = parser.parse_known_args()
 
 SHARD_INDEX = args.shard
 SHARD_TOTAL = args.shard_total
+
+# 每个分片分配的发包限额
+SHARD_MAX_REQUESTS = TOTAL_MAX_REQUESTS // SHARD_TOTAL if SHARD_TOTAL > 0 else TOTAL_MAX_REQUESTS
 
 TCP_TIMEOUT = 1.0
 VERIFY_TIMEOUT = 30
@@ -169,7 +183,6 @@ def parse_ip_range(line):
     if not line or line.startswith('#') or line.startswith('@'):
         return None
     
-    # ★ 统一先提取 | 后面的归属地
     note = ''
     if '|' in line:
         parts = line.split('|', 1)
@@ -211,6 +224,14 @@ def load_ip_ranges(path):
             if r:
                 ranges.append(r)
     return ranges
+
+
+def expand_ranges_to_ips(ranges):
+    flat = []
+    for s, e, note in ranges:
+        for ip_int in range(s, e + 1):
+            flat.append((ip_int, note))
+    return flat
 
 
 def ip_int_to_str(ip_int):
@@ -434,39 +455,6 @@ def scan_port_full(ip, port):
     return True, working
 
 
-def slice_ranges(ranges, shard_index, shard_total):
-    if shard_total <= 1:
-        return ranges
-    total = sum(e - s + 1 for s, e, _ in ranges)
-    shard_size = (total + shard_total - 1) // shard_total
-    lo = shard_index * shard_size
-    hi = min(lo + shard_size, total)
-    if lo >= hi:
-        return []
-    result = []
-    cursor = 0
-    for s, e, note in ranges:
-        span = e - s + 1
-        seg_lo = cursor
-        seg_hi = cursor + span
-        if seg_hi <= lo or seg_lo >= hi:
-            cursor = seg_hi
-            continue
-        local_lo = max(0, lo - seg_lo)
-        local_hi = min(span, hi - seg_lo)
-        result.append((s + local_lo, s + local_hi - 1, note))
-        cursor = seg_hi
-    return result
-
-
-def expand_ranges_to_ips(ranges):
-    flat = []
-    for s, e, note in ranges:
-        for ip_int in range(s, e + 1):
-            flat.append((ip_int, note))
-    return flat
-
-
 def get_phase_config(phase):
     if phase == 'common':
         return COMMON_PORTS, None, OPEN_IPS_FILE
@@ -609,30 +597,50 @@ def main():
         log('未读取到有效 IP 范围')
         sys.exit(1)
 
+    # ★ 展开所有 IP，根据游标切片
+    all_ips_flat = expand_ranges_to_ips(all_ranges)
+    total_all_ips = len(all_ips_flat)
+    
+    cursor_state = load_json(CURSOR_FILE) or {'offset': 0}
+    current_offset = cursor_state.get('offset', 0)
+    
     PORTS, upstream_file, output_filter_file = get_phase_config(current_phase)
 
-    ranges = slice_ranges(all_ranges, SHARD_INDEX, SHARD_TOTAL)
-    ip_list = expand_ranges_to_ips(ranges)
+    if current_offset >= total_all_ips:
+        log('游标 %d >= 总IP数 %d，全部扫描完毕。' % (current_offset, total_all_ips))
+        if SHARD_INDEX == 0:
+            with open(FINISHED_FLAG, 'w') as f:
+                f.write('yes')
+        _skip_this_shard(STATE_FILE, output_filter_file, current_phase, 0)
+        return
+
+    batch_end = min(current_offset + BATCH_SIZE, total_all_ips)
+    batch_ips = all_ips_flat[current_offset:batch_end]
+    log('当前批次游标: %d ~ %d，本批次共 %d 个 IP' % (current_offset, batch_end, len(batch_ips)))
+
+    # 按分片切分这批 IP
+    total_in_batch = len(batch_ips)
+    shard_size = (total_in_batch + SHARD_TOTAL - 1) // SHARD_TOTAL
+    lo = SHARD_INDEX * shard_size
+    hi = min(lo + shard_size, total_in_batch)
+    my_ips = batch_ips[lo:hi]
+    
+    ip_list = my_ips
 
     if upstream_file is not None:
         if os.path.exists(upstream_file):
             wanted = load_ip_set(upstream_file)
             if wanted:
                 before = len(ip_list)
-                ip_list = [(ip_int, note) for (ip_int, note) in ip_list
-                           if ip_int_to_str(ip_int) in wanted]
+                ip_list = [(ip_int, note) for (ip_int, note) in ip_list if ip_int_to_str(ip_int) in wanted]
                 log('[%s] 上游过滤 (%s): %d → %d'
                     % (current_phase, upstream_file, before, len(ip_list)))
                 if current_phase == 'revalidate':
                     ip_note_map = {}
-                    for s, e, note in all_ranges:
-                        if not note:
-                            continue
-                        for ip_int, _ in ip_list:
-                            if s <= ip_int <= e:
-                                ip_note_map[ip_int] = note
-                    ip_list = [(ip_int, ip_note_map.get(ip_int, ''))
-                               for ip_int, _ in ip_list]
+                    for ip_int, note in my_ips:
+                        if note:
+                            ip_note_map[ip_int] = note
+                    ip_list = [(ip_int, ip_note_map.get(ip_int, '')) for ip_int, _ in ip_list]
             else:
                 log('[%s] 上游文件为空，本片无待扫 IP，跳过' % current_phase)
                 _skip_this_shard(STATE_FILE, output_filter_file, current_phase, len(PORTS))
@@ -691,7 +699,6 @@ def main():
 
     start_position = state['position']
 
-    log('本片 IP 段数: %d' % len(ranges))
     log('本片 IP 总数: %d' % total_ips)
     log('端口数: %d' % len(PORTS))
     if current_phase in ('common', 'revalidate'):
@@ -717,6 +724,8 @@ def main():
 
     log('最大运行时长: %d 秒 (%.2f 小时)'
         % (MAX_RUNTIME_SEC, MAX_RUNTIME_SEC / 3600.0))
+    log('发包熔断限额: %d 次/分片（全局 %d 次）'
+        % (SHARD_MAX_REQUESTS, TOTAL_MAX_REQUESTS))
     log('-' * 60)
 
     pos_lock = threading.Lock()
@@ -764,7 +773,6 @@ def main():
             ip_open_count = 0
             ip_proxy_count = 0
 
-            # ★ 新增：full 阶段前置探活（181端口），如果全闭则直接跳过
             if current_phase == 'full':
                 ip_alive = False
                 probe_futures = [port_pool.submit(tcp_check, ip, port) for port in COMMON_PORTS]
@@ -827,6 +835,14 @@ def main():
                 with found_lock:
                     port_tasks[0] += 1
                     processed_ports_for_ip += 1
+                    
+                    # ★ 发包熔断检查
+                    if port_tasks[0] >= SHARD_MAX_REQUESTS and not stop_flag[0]:
+                        log('[!] 单分片探活次数达到 %d，触发换 IP 熔断！' % SHARD_MAX_REQUESTS)
+                        stop_flag[0] = True
+                        current_pos[0] = total_ips
+                        return
+                        
                     if current_phase == 'full' and processed_ports_for_ip % 5000 == 0:
                         elapsed = time.time() - t0
                         ppct = processed_ports_for_ip * 100.0 / total_ports_for_ip if total_ports_for_ip else 0
