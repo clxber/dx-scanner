@@ -25,6 +25,7 @@
 ★ Bug 修复：使用 f_offset 对 full 阶段进行指纹校验，防止每批固定 IP 数引起的断点续跑错乱
 ★ 终极防御：使用 c_offset 对 common 阶段也进行指纹校验，彻底杜绝任何因为清理失败导致的秒退跳过
 ★ 文案优化：将新切片日志精准区分为“批次扫描”，消除进度清零的误解
+★ 视觉归零：当全局游标为 0 时，日志展示的历史累积 IP 强制归零，契合“重头开始”的直觉
 """
 
 import os
@@ -821,6 +822,11 @@ def main():
                         global_proxy_count += 1
         except Exception:
             pass
+
+    # ★ 视觉归零：如果在 common 阶段且是全新游标（0），历史累计清零
+    if current_phase == 'common' and current_offset == 0:
+        history_alive_count = 0
+        global_proxy_count = 0
 
     log('本片 IP 总数: %d' % total_ips)
     log('端口数: %d' % len(PORTS))
