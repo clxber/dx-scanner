@@ -23,6 +23,7 @@
 ★ Bug 修复：游标切片仅对 common 阶段生效，revalidate/proxy/full 直接读上游文件，彻底杜绝游标死锁
 ★ 参数全动态：BATCH_SIZE、FULL_BATCH_SIZE、TOTAL_MAX_REQUESTS 全部支持从环境变量读取
 ★ Bug 修复：使用 f_offset 对 full 阶段进行指纹校验，防止每批固定 IP 数引起的断点续跑错乱
+★ 终极防御：使用 c_offset 对 common 阶段也进行指纹校验，彻底杜绝任何因为清理失败导致的秒退跳过
 """
 
 import os
@@ -743,6 +744,10 @@ def main():
         if current_phase == 'full':
             if state.get('f_offset') == f_offset:
                 new_round = False
+        # 针对 common 阶段：必须全局游标 current_offset 也能对上，才是真正的同一批任务续跑
+        elif current_phase == 'common':
+            if state.get('c_offset') == current_offset:
+                new_round = False
         else:
             new_round = False
 
@@ -756,6 +761,8 @@ def main():
         }
         if current_phase == 'full':
             state['f_offset'] = f_offset
+        elif current_phase == 'common':
+            state['c_offset'] = current_offset
 
         with open(OUTPUT_FILE, 'w', encoding='utf-8', newline='') as f:
             f.write('@ 代理扫描结果 [分片 %d/%d, 阶段 %s]'
