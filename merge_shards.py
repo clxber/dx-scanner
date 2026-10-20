@@ -178,10 +178,6 @@ def _parse_ip_range(line):
                 net = ipaddress.ip_network(tok, strict=False)
                 if net.version != 4:
                     continue
-                if not note:
-                    idx = line.find(tok) + len(tok)
-                    if idx < len(line):
-                        note = line[idx:].strip()
                 return int(net.network_address), int(net.broadcast_address), note
             except Exception:
                 pass
@@ -192,10 +188,6 @@ def _parse_ip_range(line):
         try:
             sa = int(ipaddress.IPv4Address(a))
             sb = int(ipaddress.IPv4Address(b))
-            if not note:
-                idx = m.end()
-                if idx < len(line):
-                    note = line[idx:].strip()
             return min(sa, sb), max(sa, sb), note
         except Exception:
             pass
@@ -204,10 +196,6 @@ def _parse_ip_range(line):
     if m:
         try:
             a = int(ipaddress.IPv4Address(m.group(1)))
-            if not note:
-                idx = m.end()
-                if idx < len(line):
-                    note = line[idx:].strip()
             return a, a, note
         except Exception:
             pass
