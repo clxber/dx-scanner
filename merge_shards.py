@@ -13,6 +13,7 @@
   - ★ 节约原则：proxy 阶段找到多少个代理就跳过 full，阈值可配置
   - ★ 彻底收官：全量代理已扫出，或 full 阶段彻底扫完后，重置游标，清理所有中间文件
   - ★ 物理归零：当从头开始（游标 0）合并时，抛弃旧的 alive_ips.txt，彻底重头统计
+  - ★ 游标封顶：推进游标时，绝不超越实际总 IP 数（如 65536），防止出现 90000 这种虚高数字
 """
 
 import os
@@ -62,9 +63,14 @@ def save_json(path, data):
     os.replace(tmp, path)
 
 
-def move_cursor(batch_size):
+def move_cursor(batch_size, total_ips):
     state = load_json(CURSOR_FILE) or {'offset': 0}
-    state['offset'] += batch_size
+    new_offset = state['offset'] + batch_size
+    # ★ 核心修复：如果推进后超过总 IP 数，直接封顶在总 IP 数
+    if total_ips > 0 and new_offset > total_ips:
+        new_offset = total_ips
+    
+    state['offset'] = new_offset
     save_json(CURSOR_FILE, state)
     log('游标已推进至: %d' % state['offset'])
 
@@ -172,6 +178,10 @@ def _parse_ip_range(line):
                 net = ipaddress.ip_network(tok, strict=False)
                 if net.version != 4:
                     continue
+                if not note:
+                    idx = line.find(tok) + len(tok)
+                    if idx < len(line):
+                        note = line[idx:].strip()
                 return int(net.network_address), int(net.broadcast_address), note
             except Exception:
                 pass
@@ -182,6 +192,10 @@ def _parse_ip_range(line):
         try:
             sa = int(ipaddress.IPv4Address(a))
             sb = int(ipaddress.IPv4Address(b))
+            if not note:
+                idx = m.end()
+                if idx < len(line):
+                    note = line[idx:].strip()
             return min(sa, sb), max(sa, sb), note
         except Exception:
             pass
@@ -190,6 +204,10 @@ def _parse_ip_range(line):
     if m:
         try:
             a = int(ipaddress.IPv4Address(m.group(1)))
+            if not note:
+                idx = m.end()
+                if idx < len(line):
+                    note = line[idx:].strip()
             return a, a, note
         except Exception:
             pass
@@ -336,7 +354,16 @@ def handle_verify_existing(phase_state):
             'proxy_completed': False,
             'full_completed': False,
         })
-        move_cursor(BATCH_SIZE)
+        
+        all_ips_flat_count = 0
+        if os.path.exists('ip_list.txt'):
+            with open('ip_list.txt', 'r', encoding='utf-8-sig', errors='ignore') as f:
+                for line in f:
+                    r = _parse_ip_range(line)
+                    if r:
+                        all_ips_flat_count += (r[1] - r[0] + 1)
+        move_cursor(BATCH_SIZE, all_ips_flat_count)
+        
         log('phase.json 已重置为 common（自动触发下一轮）')
         set_trigger('yes')
 
@@ -527,7 +554,7 @@ def main():
                 except Exception as e:
                     log('[!] 暂存存活 IP 失败: %s' % e)
                 
-                move_cursor(BATCH_SIZE)
+                move_cursor(BATCH_SIZE, all_ips_flat_count)
                 phase_state['current'] = 'common'
                 save_json(PHASE_FILE, phase_state)
                 
