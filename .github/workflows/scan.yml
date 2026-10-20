@@ -15,6 +15,10 @@ on:
         description: '全局总探活次数熔断限额'
         required: false
         default: '5500000'
+      proxy_threshold:
+        description: '节约原则阈值：proxy阶段找到多少个代理就跳过full'
+        required: false
+        default: '1'
 
 permissions:
   contents: write
@@ -674,6 +678,7 @@ jobs:
         if: always() && steps.check_cancel.outputs.is_cancelled == 'false'
         env:
           BATCH_SIZE: ${{ github.event.inputs.batch_size || '30000' }}
+          PROXY_THRESHOLD: ${{ github.event.inputs.proxy_threshold || '1' }}
         run: python merge_shards.py
 
       - name: 提交合并
@@ -699,7 +704,8 @@ jobs:
             gh workflow run scan.yml --ref main \
               -f batch_size="${{ github.event.inputs.batch_size || '30000' }}" \
               -f full_batch_size="${{ github.event.inputs.full_batch_size || '10' }}" \
-              -f total_max_requests="${{ github.event.inputs.total_max_requests || '5500000' }}"
+              -f total_max_requests="${{ github.event.inputs.total_max_requests || '5500000' }}" \
+              -f proxy_threshold="${{ github.event.inputs.proxy_threshold || '1' }}"
           else
             echo "✅ 结束，等待手动触发"
           fi
