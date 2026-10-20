@@ -46,6 +46,7 @@ jobs:
             proxy_ips_shard0.txt
             open_ips_revalidated_shard0.txt
             proxy_missing_shard0.txt
+            full_cursor_shard0.json
             scan_finished.flag
           if-no-files-found: ignore
       - name: 提交
@@ -55,6 +56,7 @@ jobs:
                    open_ips_shard0.txt proxy_ips_shard0.txt \
                    open_ips_revalidated_shard0.txt \
                    proxy_missing_shard0.txt \
+                   full_cursor_shard0.json \
                    scan_finished.flag; do
             if [ -f "$f" ]; then
               git add "$f"
@@ -108,6 +110,7 @@ jobs:
             proxy_ips_shard1.txt
             open_ips_revalidated_shard1.txt
             proxy_missing_shard1.txt
+            full_cursor_shard1.json
             scan_finished.flag
           if-no-files-found: ignore
       - name: 提交
@@ -117,6 +120,7 @@ jobs:
                    open_ips_shard1.txt proxy_ips_shard1.txt \
                    open_ips_revalidated_shard1.txt \
                    proxy_missing_shard1.txt \
+                   full_cursor_shard1.json \
                    scan_finished.flag; do
             if [ -f "$f" ]; then
               git add "$f"
@@ -170,6 +174,7 @@ jobs:
             proxy_ips_shard2.txt
             open_ips_revalidated_shard2.txt
             proxy_missing_shard2.txt
+            full_cursor_shard2.json
             scan_finished.flag
           if-no-files-found: ignore
       - name: 提交
@@ -179,6 +184,7 @@ jobs:
                    open_ips_shard2.txt proxy_ips_shard2.txt \
                    open_ips_revalidated_shard2.txt \
                    proxy_missing_shard2.txt \
+                   full_cursor_shard2.json \
                    scan_finished.flag; do
             if [ -f "$f" ]; then
               git add "$f"
@@ -232,6 +238,7 @@ jobs:
             proxy_ips_shard3.txt
             open_ips_revalidated_shard3.txt
             proxy_missing_shard3.txt
+            full_cursor_shard3.json
             scan_finished.flag
           if-no-files-found: ignore
       - name: 提交
@@ -241,6 +248,7 @@ jobs:
                    open_ips_shard3.txt proxy_ips_shard3.txt \
                    open_ips_revalidated_shard3.txt \
                    proxy_missing_shard3.txt \
+                   full_cursor_shard3.json \
                    scan_finished.flag; do
             if [ -f "$f" ]; then
               git add "$f"
@@ -294,6 +302,7 @@ jobs:
             proxy_ips_shard4.txt
             open_ips_revalidated_shard4.txt
             proxy_missing_shard4.txt
+            full_cursor_shard4.json
             scan_finished.flag
           if-no-files-found: ignore
       - name: 提交
@@ -303,6 +312,7 @@ jobs:
                    open_ips_shard4.txt proxy_ips_shard4.txt \
                    open_ips_revalidated_shard4.txt \
                    proxy_missing_shard4.txt \
+                   full_cursor_shard4.json \
                    scan_finished.flag; do
             if [ -f "$f" ]; then
               git add "$f"
@@ -356,6 +366,7 @@ jobs:
             proxy_ips_shard5.txt
             open_ips_revalidated_shard5.txt
             proxy_missing_shard5.txt
+            full_cursor_shard5.json
             scan_finished.flag
           if-no-files-found: ignore
       - name: 提交
@@ -365,6 +376,7 @@ jobs:
                    open_ips_shard5.txt proxy_ips_shard5.txt \
                    open_ips_revalidated_shard5.txt \
                    proxy_missing_shard5.txt \
+                   full_cursor_shard5.json \
                    scan_finished.flag; do
             if [ -f "$f" ]; then
               git add "$f"
@@ -418,6 +430,7 @@ jobs:
             proxy_ips_shard6.txt
             open_ips_revalidated_shard6.txt
             proxy_missing_shard6.txt
+            full_cursor_shard6.json
             scan_finished.flag
           if-no-files-found: ignore
       - name: 提交
@@ -427,6 +440,7 @@ jobs:
                    open_ips_shard6.txt proxy_ips_shard6.txt \
                    open_ips_revalidated_shard6.txt \
                    proxy_missing_shard6.txt \
+                   full_cursor_shard6.json \
                    scan_finished.flag; do
             if [ -f "$f" ]; then
               git add "$f"
@@ -480,6 +494,7 @@ jobs:
             proxy_ips_shard7.txt
             open_ips_revalidated_shard7.txt
             proxy_missing_shard7.txt
+            full_cursor_shard7.json
             scan_finished.flag
           if-no-files-found: ignore
       - name: 提交
@@ -489,6 +504,7 @@ jobs:
                    open_ips_shard7.txt proxy_ips_shard7.txt \
                    open_ips_revalidated_shard7.txt \
                    proxy_missing_shard7.txt \
+                   full_cursor_shard7.json \
                    scan_finished.flag; do
             if [ -f "$f" ]; then
               git add "$f"
@@ -555,6 +571,7 @@ jobs:
           rm -f open_ips_revalidated_shard*.txt
           rm -f proxy_missing_shard*.txt
           rm -f working_proxies_shard*.txt
+          rm -f full_cursor_shard*.json
           rm -f phase.json
           rm -f alive_ips.txt
           rm -f scan_finished.flag
