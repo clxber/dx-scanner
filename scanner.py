@@ -19,6 +19,7 @@
 ★ 游标切片：按 BATCH_SIZE 切片，无缝换 IP 防止被防火墙封禁
 ★ full 游标切片：按 FULL_BATCH_SIZE=10 切片，单次扫 65 万次，彻底杜绝熔断误伤
 ★ 新增发包熔断：按 TOTAL_MAX_REQUESTS 限制，触发立即停止，严防高校防火墙封禁
+★ 无缝接力：熔断触发时不再强行标记本片完成，且 full 阶段只有整批扫完才推进游标，彻底消灭漏扫
 ★ 验证诊断：verify_existing 阶段打印详细的中文失败原因，一眼看出是代理挂了、超时、还是被读秀WAF拦截
 ★ Bug 修复：游标切片仅对 common 阶段生效，revalidate/proxy/full 直接读上游文件，彻底杜绝游标死锁
 ★ 参数全动态：BATCH_SIZE、FULL_BATCH_SIZE、TOTAL_MAX_REQUESTS 全部支持从环境变量读取
@@ -928,7 +929,7 @@ def main():
                         real_done = start_position + processed_ips[0]
                         pct = real_done * 100.0 / total_ips if total_ips else 0
                         elapsed = time.time() - t0
-                        log('[full] IP %s 探活失败 (181端口全闭)，跳过全端口 | 本片 %d/%d (%.2f%%) | %.0f s'
+                        log('[full] IP %s 探活失败 (188端口全闭)，跳过全端口 | 本片 %d/%d (%.2f%%) | %.0f s'
                             % (ip, real_done, total_ips, pct, elapsed))
                     continue
 
@@ -980,7 +981,7 @@ def main():
                             if port_tasks[0] >= SHARD_MAX_REQUESTS and not stop_flag[0]:
                                 log('[!] 单分片探活次数达到 %d，触发换 IP 熔断！' % SHARD_MAX_REQUESTS)
                                 stop_flag[0] = True
-                                current_pos[0] = total_ips
+                                # ★ 核心修复：不再强制 current_pos = total_ips，保留现场
                                 return
                     if stop_flag[0]: return
 
@@ -1031,7 +1032,7 @@ def main():
                         if port_tasks[0] >= SHARD_MAX_REQUESTS and not stop_flag[0]:
                             log('[!] 单分片探活次数达到 %d，触发换 IP 熔断！' % SHARD_MAX_REQUESTS)
                             stop_flag[0] = True
-                            current_pos[0] = total_ips
+                            # ★ 核心修复：不再强制 current_pos = total_ips，保留现场
                             return
                     if short_circuit and ip_has_open:
                         break
@@ -1211,16 +1212,20 @@ def main():
             log('[!] 写待深扫文件失败: %s' % e)
 
     if current_phase == 'full':
-        fc_state = load_json(FULL_CURSOR_FILE) or {'offset': 0}
-        fc_state['offset'] += len(ip_list)
-        save_json(FULL_CURSOR_FILE, fc_state)
-        
-        if fc_state['offset'] >= all_upstream_ips_len:
-            state['completed'] = True
-            log('[full] 本片所有 IP 已全部扫描完毕 (游标 %d >= %d)。' % (fc_state['offset'], all_upstream_ips_len))
+        # ★ 核心修复：只有在这批 IP 彻底扫完时，才推进游标！
+        # 如果是因为熔断中断的（state['completed'] == False），游标原地不动，
+        # 下一轮重新拉起时会继续从 f_offset 开始取这一批 IP，结合 progress 文件实现无缝接力。
+        if state.get('completed'):
+            fc_state = load_json(FULL_CURSOR_FILE) or {'offset': 0}
+            fc_state['offset'] += len(ip_list)
+            save_json(FULL_CURSOR_FILE, fc_state)
+            
+            if fc_state['offset'] >= all_upstream_ips_len:
+                log('[full] 本片所有 IP 已全部扫描完毕 (游标 %d >= %d)。' % (fc_state['offset'], all_upstream_ips_len))
+            else:
+                log('[full] 本批次扫完，游标推进至 %d，还剩余 %d 个 IP 待下次接力扫描。' % (fc_state['offset'], all_upstream_ips_len - fc_state['offset']))
         else:
-            state['completed'] = False
-            log('[full] 本 session 结束，还剩余 %d 个 IP 待下次接力扫描。' % (all_upstream_ips_len - fc_state['offset']))
+            log('[full] 触发熔断或中断，保留游标 %d 不变，下一轮无缝续扫剩余端口。' % f_offset)
 
     save_json(STATE_FILE, state)
 
