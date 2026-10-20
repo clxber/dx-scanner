@@ -21,6 +21,7 @@
 ★ 新增发包熔断：按 TOTAL_MAX_REQUESTS 限制，触发立即停止，严防高校防火墙封禁
 ★ 无缝接力：熔断触发时不再强行标记本片完成，且 full 阶段只有整批扫完才推进游标，彻底消灭漏扫
 ★ 兄弟分片联动：若本分片在当前批次已 100% 完成，下一轮启动时直接秒退，绝不陪跑重扫
+★ 草稿纸保护：秒退时绝对不覆盖清空已有的存活 IP 记录，保证数据只增不减
 ★ 验证诊断：verify_existing 阶段打印详细的中文失败原因，一眼看出是代理挂了、超时、还是被读秀WAF拦截
 ★ Bug 修复：游标切片仅对 common 阶段生效，revalidate/proxy/full 直接读上游文件，彻底杜绝游标死锁
 ★ 参数全动态：BATCH_SIZE、FULL_BATCH_SIZE、TOTAL_MAX_REQUESTS 全部支持从环境变量读取
@@ -504,12 +505,10 @@ def _skip_this_shard(state_file, output_filter_file, phase, ports_count):
         'session': 1,
     }
     save_json(state_file, state)
+    
+    # ★ 核心修复：秒退时绝不清空草稿纸，防止把上个 session 找到的存活 IP 给扬了
     if output_filter_file:
-        try:
-            with open(output_filter_file, 'w', encoding='utf-8', newline='') as f:
-                pass
-        except Exception:
-            pass
+        pass
 
 
 def _translate_reason(reason):
