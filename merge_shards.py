@@ -10,6 +10,7 @@
   - ★ 跨批次累积：存活 IP 明细（alive_ips.txt）每次生成前读取旧的并合并去重
   - ★ 【核心】common 阶段扫完：推进游标，继续扫下一批
   - ★ 【核心】full 阶段：如果未扫完，会保留 proxy_missing_shard 文件，继续接力
+  - ★ 节约原则：proxy 阶段找到多少个代理就跳过 full，阈值可配置
   - ★ 彻底收官：全量代理已扫出，或 full 阶段彻底扫完后，重置游标，清理所有中间文件
   - ★ 物理归零：当从头开始（游标 0）合并时，抛弃旧的 alive_ips.txt，彻底重头统计
 """
@@ -25,6 +26,8 @@ import shutil
 
 # ============ 核心调度参数（自动从环境变量读取） ============
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 30000))
+# 节约原则阈值：proxy 阶段找到多少条记录就跳过 full
+PROXY_THRESHOLD = int(os.environ.get('PROXY_THRESHOLD', 5))
 # ========================================================
 
 SHARD_TOTAL = 8
@@ -548,17 +551,17 @@ def main():
                 trigger = 'yes'
 
         elif current_phase == 'proxy':
-            if len(new_lines) >= 1:
-                log('proxy 完成，本轮找到 %d 个代理 → 结束（节约原则，跳过 full）'
-                    % len(new_lines))
+            if len(new_lines) >= PROXY_THRESHOLD:
+                log('proxy 完成，本轮找到 %d 个代理（阈值 %d）→ 结束（节约原则，跳过 full）'
+                    % (len(new_lines), PROXY_THRESHOLD))
                 phase_state['proxy_completed'] = True
                 phase_state['full_completed'] = True
                 save_json(PHASE_FILE, phase_state)
                 trigger = 'no'
                 should_cleanup = True
             else:
-                log('proxy 完成，0 条代理 → 切 full（深扫剩余 %d 个 IP）'
-                    % total_missing)
+                log('proxy 完成，%d 条代理（未达阈值 %d）→ 切 full（深扫剩余 %d 个 IP）'
+                    % (len(new_lines), PROXY_THRESHOLD, total_missing))
                 phase_state['current'] = 'full'
                 phase_state['proxy_completed'] = True
                 save_json(PHASE_FILE, phase_state)
