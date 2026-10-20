@@ -5,9 +5,9 @@
   "phase": "full",
   "shard_index": 0,
   "shard_total": 8,
-  "started_at": "2026-10-20 07:08:15",
+  "started_at": "2026-10-20 07:50:09",
   "completed": false,
   "session": 1,
-  "f_offset": 0,
-  "completed_at": "2026-10-20 07:13:06"
+  "f_offset": 10,
+  "completed_at": "2026-10-20 07:54:45"
 }
