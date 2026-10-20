@@ -17,6 +17,7 @@
 ★ 彻底取消验证限速（VERIFY_RATE_LIMIT=0），且内嵌验证并发，解决串行卡 35 分钟的问题
 ★ full 前置探活：全端口前先探 COMMON_PORTS（181个），若全闭直接跳过，防止死 IP 浪费时间
 ★ 游标切片：按 BATCH_SIZE 切片，无缝换 IP 防止被防火墙封禁
+★ full 游标切片：按 FULL_BATCH_SIZE=10 切片，单次扫 65 万次，彻底杜绝熔断误伤
 ★ 新增发包熔断：按 TOTAL_MAX_REQUESTS 限制，触发立即停止，严防高校防火墙封禁
 ★ 验证诊断：verify_existing 阶段打印详细的中文失败原因，一眼看出是代理挂了、超时、还是被读秀WAF拦截
 ★ Bug 修复：游标切片仅对 common 阶段生效，revalidate/proxy/full 直接读上游文件，彻底杜绝游标死锁
@@ -37,11 +38,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============ 核心调度参数（每次换学校请根据需要修改） ============
-# 每次触发 Actions 扫描的总 IP 数量（会自动均分给 8 个分片，如 30000 即每分片 3750 个）
+# common 阶段每次触发的 IP 数量（8 分片均分）
 BATCH_SIZE = 30000
 
-# 全局总探活次数熔断限额（单分片限额 = TOTAL_MAX_REQUESTS / 8，如 5500000 即单分片 687500 次）
-# 如果学校防火墙容易封，可以调小；如果一直没被封且速度很快，可以调大。
+# full 阶段每次触发的 IP 数量（每个分片每次只扫 10 个 IP 的全端口）
+FULL_BATCH_SIZE = 10
+
+# 全局总探活次数熔断限额（单分片限额 = TOTAL_MAX_REQUESTS / 8 = 687500）
 TOTAL_MAX_REQUESTS = 5500000
 # ===============================================================
 
@@ -50,7 +53,6 @@ FINISHED_FLAG = 'scan_finished.flag'
 
 # ============ 配置 ============
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-
 CONNECT_TIMEOUT = 15
 MAX_TIME = 30
 
@@ -76,7 +78,6 @@ def _build_proxy_ports():
         (10000, 10010), (10080, 10086), (3128, 3130), (8388, 8389),
         (8443, 8444), (2052, 2096), (51820, 51830), (1194, 1199),
         (9050, 9051), (9150, 9151),
-        # ★ 根据真实代理列表，新增独立端口
         (15732, 15732), (26001, 26001), (29290, 29290),
         (10090, 10090), (17891, 17891), (10792, 10792),
         (8429, 8429), (10684, 10684), (16699, 16699),
@@ -137,6 +138,7 @@ if SHARD_TOTAL > 1:
     PROXY_IPS_FILE = 'proxy_ips_shard%d.txt' % SHARD_INDEX
     OPEN_IPS_REVALIDATED_FILE = 'open_ips_revalidated_shard%d.txt' % SHARD_INDEX
     PROXY_MISSING_FILE = 'proxy_missing_shard%d.txt' % SHARD_INDEX
+    FULL_CURSOR_FILE = 'full_cursor_shard%d.json' % SHARD_INDEX
 else:
     STATE_FILE = 'progress.json'
     OUTPUT_FILE = 'working_proxies.txt'
@@ -144,6 +146,7 @@ else:
     PROXY_IPS_FILE = 'proxy_ips.txt'
     OPEN_IPS_REVALIDATED_FILE = 'open_ips_revalidated.txt'
     PROXY_MISSING_FILE = 'proxy_missing.txt'
+    FULL_CURSOR_FILE = 'full_cursor.json'
 
 CRLF = '\r\n'
 EXISTING_PROXIES_FILE = 'working_proxies.txt'
@@ -417,7 +420,6 @@ def _verify_one_url(ip, port, protocol, url, keywords, excludes):
         if any(kw in text for kw in keywords):
             return True, "ok"
             
-        # 如果没命中关键词，抓取前 30 个字符作为诊断
         snippet = text[:30].replace('\n', ' ').replace('\r', ' ')
         return False, "no_keyword: %s" % snippet
         
@@ -635,9 +637,12 @@ def main():
     ip_list = []
     current_offset = 0
     total_all_ips = 0
+    all_upstream_ips_len = 0
+    batch_end = 0
+    f_offset = 0
 
     if current_phase == 'common':
-        # ============ common 阶段：游标切片逻辑 ============
+        # ============ common 阶段：全量游标切片 ============
         all_ranges = load_ip_ranges(INPUT_FILE)
         if not all_ranges:
             log('未读取到有效 IP 范围')
@@ -668,7 +673,7 @@ def main():
         ip_list = batch_ips[lo:hi]
         
     else:
-        # ============ revalidate / proxy / full 阶段：直接读上游分片文件，不受游标限制 ============
+        # ============ revalidate / proxy / full 阶段：直接读上游分片文件 ============
         if upstream_file is not None and os.path.exists(upstream_file):
             wanted = load_ip_set(upstream_file)
             if wanted:
@@ -676,6 +681,7 @@ def main():
                 if os.path.exists(INPUT_FILE):
                     all_ranges = load_ip_ranges(INPUT_FILE)
                 
+                all_upstream_ips = []
                 for w in wanted:
                     try:
                         ip_int = int(ipaddress.IPv4Address(w))
@@ -686,8 +692,27 @@ def main():
                         if s <= ip_int <= e:
                             note = n
                             break
-                    ip_list.append((ip_int, note))
-                log('[%s] 从上游文件 %s 加载了 %d 个 IP' % (current_phase, upstream_file, len(ip_list)))
+                    all_upstream_ips.append((ip_int, note))
+                
+                all_upstream_ips_len = len(all_upstream_ips)
+
+                if current_phase == 'full':
+                    # ★ full 阶段也采用游标切片，每次只扫 FULL_BATCH_SIZE 个 IP
+                    fc_state = load_json(FULL_CURSOR_FILE) or {'offset': 0}
+                    f_offset = fc_state.get('offset', 0)
+                    
+                    if f_offset >= all_upstream_ips_len:
+                        log('[full] 本片所有 IP 的全端口已扫完 (游标 %d >= %d)。' % (f_offset, all_upstream_ips_len))
+                        _skip_this_shard(STATE_FILE, output_filter_file, current_phase, len(PORTS))
+                        return
+                        
+                    batch_end = min(f_offset + FULL_BATCH_SIZE, all_upstream_ips_len)
+                    ip_list = all_upstream_ips[f_offset:batch_end]
+                    log('[full] 从上游文件加载: 本片共 %d 个，当前游标 %d~%d，本次扫 %d 个 IP 的全端口' 
+                        % (all_upstream_ips_len, f_offset, batch_end, len(ip_list)))
+                else:
+                    ip_list = all_upstream_ips
+                    log('[%s] 从上游文件 %s 加载了 %d 个 IP' % (current_phase, upstream_file, len(ip_list)))
             else:
                 log('[%s] 上游文件为空，本片无待扫 IP，跳过' % current_phase)
                 _skip_this_shard(STATE_FILE, output_filter_file, current_phase, len(PORTS))
@@ -750,7 +775,6 @@ def main():
 
     start_position = state['position']
 
-    # ★ 读取全局累积数据，用于日志展示
     history_alive_count = 0
     if os.path.exists('alive_ips.txt'):
         try:
@@ -776,9 +800,10 @@ def main():
     if current_phase in ('common', 'revalidate'):
         log('  前 12 探针: %s' % PROBE_PORTS_12)
     
-    # ★ 日志展示全量视角
     if current_phase == 'common':
         log('本次起点: 本片 IP #%d (全局游标 #%d / 总 %d)' % (state['position'], current_offset, total_all_ips))
+    elif current_phase == 'full':
+        log('本次起点: 本片 IP #%d (来源: %s, 游标 %d/%d)' % (state['position'], upstream_file, f_offset, all_upstream_ips_len))
     else:
         log('本次起点: 本片 IP #%d (来源: %s)' % (state['position'], upstream_file))
         
@@ -866,7 +891,7 @@ def main():
                         real_done = start_position + processed_ips[0]
                         pct = real_done * 100.0 / total_ips if total_ips else 0
                         elapsed = time.time() - t0
-                        log('[full] IP %s 探活失败 (181端口全闭)，跳过全端口 | 全局 %d/%d (%.2f%%) | %.0f s'
+                        log('[full] IP %s 探活失败 (181端口全闭)，跳过全端口 | 本片 %d/%d (%.2f%%) | %.0f s'
                             % (ip, real_done, total_ips, pct, elapsed))
                     continue
 
@@ -916,14 +941,13 @@ def main():
                     port_tasks[0] += 1
                     processed_ports_for_ip += 1
                     
-                    # ★ 发包熔断检查
                     if port_tasks[0] >= SHARD_MAX_REQUESTS and not stop_flag[0]:
                         log('[!] 单分片探活次数达到 %d，触发换 IP 熔断！' % SHARD_MAX_REQUESTS)
                         stop_flag[0] = True
                         current_pos[0] = total_ips
                         return
                         
-                    if current_phase == 'full' and processed_ports_for_ip % 5000 == 0:
+                    if current_phase == 'full' and processed_ports_for_ip % 10000 == 0:
                         elapsed = time.time() - t0
                         ppct = processed_ports_for_ip * 100.0 / total_ports_for_ip if total_ports_for_ip else 0
                         log('[full] %s 端口 %d/%d (%.1f%%) | 开放 %d | 本片代理 %d | %.0f s'
@@ -989,7 +1013,7 @@ def main():
                 if current_phase == 'full':
                     elapsed = time.time() - t0
                     speed = port_tasks[0] / elapsed if elapsed > 0 else 0
-                    log('[full] IP #%d %s 扫完 | 本 IP: 端口开放 %d, 代理 %d | 全局 %d/%d (%.2f%%) | 累计代理 %d | %.1f task/s | %.0f s'
+                    log('[full] IP #%d %s 扫完 | 本 IP: 端口开放 %d, 代理 %d | 本片 %d/%d (%.2f%%) | 累计代理 %d | %.1f task/s | %.0f s'
                         % (real_done, ip, ip_open_count, ip_proxy_count,
                            real_done, total_ips, pct,
                            found_count[0], speed, elapsed))
@@ -1105,6 +1129,18 @@ def main():
                 % (PROXY_MISSING_FILE, len(proxy_missing_ips), len(existing_missing)))
         except Exception as e:
             log('[!] 写待深扫文件失败: %s' % e)
+
+    if current_phase == 'full':
+        fc_state = load_json(FULL_CURSOR_FILE) or {'offset': 0}
+        fc_state['offset'] += len(ip_list)
+        save_json(FULL_CURSOR_FILE, fc_state)
+        
+        if fc_state['offset'] >= all_upstream_ips_len:
+            state['completed'] = True
+            log('[full] 本片所有 IP 已全部扫描完毕 (游标 %d >= %d)。' % (fc_state['offset'], all_upstream_ips_len))
+        else:
+            state['completed'] = False
+            log('[full] 本 session 结束，还剩余 %d 个 IP 待下次接力扫描。' % (all_upstream_ips_len - fc_state['offset']))
 
     save_json(STATE_FILE, state)
 
