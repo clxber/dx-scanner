@@ -4,11 +4,11 @@
   "total_ips": 0,
   "total_tasks": 0,
   "ports_count": 0,
-  "phase": "common",
+  "phase": "full",
   "shard_index": 4,
   "shard_total": 8,
-  "started_at": "2026-10-20 04:46:30",
+  "started_at": "2026-10-20 04:47:43",
   "completed": true,
-  "completed_at": "2026-10-20 04:46:30",
+  "completed_at": "2026-10-20 04:47:43",
   "session": 1
 }
