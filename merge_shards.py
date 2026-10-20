@@ -11,6 +11,7 @@
   - ★ 【核心】common 阶段扫完：推进游标，继续扫下一批
   - ★ 【核心】full 阶段：如果未扫完，会保留 proxy_missing_shard 文件，继续接力
   - ★ 彻底收官：全量代理已扫出，或 full 阶段彻底扫完后，重置游标，清理所有中间文件
+  - ★ 物理归零：当从头开始（游标 0）合并时，抛弃旧的 alive_ips.txt，彻底重头统计
 """
 
 import os
@@ -192,10 +193,10 @@ def _parse_ip_range(line):
     return None
 
 
-def build_alive_ip_ranges():
+def build_alive_ip_ranges(ignore_old=False):
     alive_ints = set()
 
-    if os.path.exists(ALIVE_IPS_FILE):
+    if not ignore_old and os.path.exists(ALIVE_IPS_FILE):
         with open(ALIVE_IPS_FILE, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
                 line = line.strip()
@@ -344,7 +345,8 @@ def main():
         log('=' * 60)
         
         try:
-            build_alive_ip_ranges()
+            # 全量收尾，这里肯定不用 ignore_old，因为要把所有的汇总
+            build_alive_ip_ranges(ignore_old=False)
         except Exception as e:
             log('[!] 最终汇总失败: %s' % e)
 
@@ -514,7 +516,11 @@ def main():
             else:
                 log('common 阶段完成，存活 IP %d，有代理的 IP %d → 暂存存活 IP，推进游标开启下一批' % (total_open, total_proxy_ips))
                 try:
-                    build_alive_ip_ranges()
+                    # ★ 物理归零：如果是第一波（游标 0），不要合并历史记录，重头开始统计
+                    if current_offset == 0:
+                        build_alive_ip_ranges(ignore_old=True)
+                    else:
+                        build_alive_ip_ranges(ignore_old=False)
                 except Exception as e:
                     log('[!] 暂存存活 IP 失败: %s' % e)
                 
@@ -570,7 +576,7 @@ def main():
         log('一轮完整结束，生成存活 IP 明细及段统计 + 清理分片文件...')
 
         try:
-            build_alive_ip_ranges()
+            build_alive_ip_ranges(ignore_old=False)
         except Exception as e:
             log('[!] 生成存活 IP 文件失败: %s' % e)
 
