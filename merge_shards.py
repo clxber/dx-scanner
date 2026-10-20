@@ -22,10 +22,9 @@ import re
 import ipaddress
 import shutil
 
-# ============ 核心调度参数 ============
-BATCH_SIZE = 30000
-TOTAL_MAX_REQUESTS = 5500000
-# ======================================
+# ============ 核心调度参数（自动从环境变量读取） ============
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 30000))
+# ========================================================
 
 SHARD_TOTAL = 8
 PHASE_FILE = 'phase.json'
@@ -114,7 +113,7 @@ def cleanup_shard_files():
         'open_ips_revalidated_shard*.txt',
         'proxy_missing_shard*.txt',
         'working_proxies_shard*.txt',
-        'full_cursor_shard*.json',  # ★ 新增清理 full 阶段游标
+        'full_cursor_shard*.json',
     ]
     removed = 0
     for pat in patterns:
