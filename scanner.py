@@ -3,19 +3,19 @@
 高校代理扫描器 —— 五阶段 + 分片 + 断点续跑
 
 阶段 1 verify_existing：验证已有代理（只有分片 0 干活）
-阶段 2 common         ：12 探针 + 177 代理（TCP 探活，IP 级短路）+ 顺便代理验证
+阶段 2 common         ：12 探针 + 183 代理（TCP 探活，IP 级短路）+ 顺便代理验证
                         → 输出 open_ips_shardN.txt（所有存活 IP）
                         → 输出 proxy_ips_shardN.txt（有代理的 IP，供 revalidate 用）
 阶段 3 revalidate     ：对 proxy_ips_shardN.txt（有代理的 IP）二次探活
-阶段 4 proxy          ：177 代理端口（完整扫描 + 单验证，3 协议全试）
+阶段 4 proxy          ：183 代理端口（完整扫描 + 单验证，3 协议全试）
 阶段 5 full           ：65535 全端口（只扫 proxy 未找到代理的 IP）
 
 验证：单验证 —— 读秀（https://www.duxiu.com/），命中「读秀学术搜索」才算有效代理
 代理协议：http / socks5 / socks4（已去掉 https）
-★ 终极定版：TCP_TIMEOUT=1.0，CONNECT_TIMEOUT=15，MAX_TIME=30
+★ 终极定版：TCP_TIMEOUT=1.0，CONNECT_TIMEOUT=10，MAX_TIME=20 (防假死极速超时)
 ★ 极限并发：80×25 = 2000 并发（实测 2500 task/s）
 ★ 彻底取消验证限速（VERIFY_RATE_LIMIT=0），且内嵌验证并发，解决串行卡 35 分钟的问题
-★ full 前置探活：全端口前先探 COMMON_PORTS（181个），若全闭直接跳过，防止死 IP 浪费时间
+★ full 前置探活：全端口前先探 COMMON_PORTS（188个），若全闭直接跳过，防止死 IP 浪费时间
 ★ 游标切片：按 BATCH_SIZE 切片，无缝换 IP 防止被防火墙封禁
 ★ full 游标切片：按 FULL_BATCH_SIZE=10 切片，单次扫 65 万次，彻底杜绝熔断误伤
 ★ 新增发包熔断：按 TOTAL_MAX_REQUESTS 限制，触发立即停止，严防高校防火墙封禁
@@ -26,6 +26,8 @@
 ★ 终极防御：使用 c_offset 对 common 阶段也进行指纹校验，彻底杜绝任何因为清理失败导致的秒退跳过
 ★ 文案优化：将新切片日志精准区分为“批次扫描”，消除进度清零的误解
 ★ 视觉归零：当全局游标为 0 时，日志展示的历史累积 IP 强制归零，契合“重头开始”的直觉
+★ 性能重构：full 阶段采用滑动窗口分批提交（每次 5000 个端口），既压满 2000 并发，又防止内存/GIL假死
+★ 战利品入库：将中科大实测有效端口 3123 加入常用代理端口池
 """
 
 import os
@@ -58,8 +60,9 @@ FINISHED_FLAG = 'scan_finished.flag'
 
 # ============ 配置 ============
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-CONNECT_TIMEOUT = 15
-MAX_TIME = 30
+# ★ 优化：极速超时，假死代理不配等 30 秒
+CONNECT_TIMEOUT = 10
+MAX_TIME = 20
 
 VERIFY_TARGETS = [
     {
@@ -87,6 +90,7 @@ def _build_proxy_ports():
         (10090, 10090), (17891, 17891), (10792, 10792),
         (8429, 8429), (10684, 10684), (16699, 16699),
         (8902, 8902), (18080, 18080), (17897, 17897),
+        (3123, 3123),
     ]
     s = set()
     for a, b in groups:
@@ -928,66 +932,109 @@ def main():
                             % (ip, real_done, total_ips, pct, elapsed))
                     continue
 
-            futures = []
-            for port in PORTS:
-                all_done = True
-                for proto in PROTOCOLS:
-                    if '%s:%d:%s' % (ip, port, proto) not in existing:
-                        all_done = False
-                        break
-                if all_done:
-                    continue
-                futures.append((port, port_pool.submit(scan_fn, ip, port)))
-
-            total_ports_for_ip = len(futures)
-            processed_ports_for_ip = 0
-
-            for port, fut in futures:
-                if stop_flag[0]:
-                    return
-                try:
-                    is_open, r_list = fut.result()
-                except Exception:
-                    is_open, r_list = False, []
-                if is_open:
-                    ip_has_open = True
-                    ip_open_count += 1
-                if r_list:
-                    ip_has_proxy = True
-                    for item in r_list:
-                        ip_, port_, proto_ = item
-                        key = '%s:%d:%s' % (ip_, port_, proto_)
-                        with found_lock:
-                            if key in existing:
-                                continue
-                            existing.add(key)
-                            found_count[0] += 1
-                            ip_proxy_count += 1
-                            if note:
-                                line_out = '%s:%d@%s@%s' % (ip_, port_, proto_, note)
-                            else:
-                                line_out = '%s:%d@%s' % (ip_, port_, proto_)
-                            with open(OUTPUT_FILE, 'a', encoding='utf-8', newline='') as f:
-                                f.write(line_out + CRLF)
-                            log('[+] ' + line_out)
-                with found_lock:
-                    port_tasks[0] += 1
-                    processed_ports_for_ip += 1
+            # ★ 优化：针对 full 阶段，采用滑动窗口分批提交（5000），防止内存和 GIL 假死
+            if current_phase == 'full':
+                chunk_size = 5000
+                for i in range(0, len(PORTS), chunk_size):
+                    chunk_ports = PORTS[i:i+chunk_size]
+                    chunk_futures = []
+                    for port in chunk_ports:
+                        all_done = True
+                        for proto in PROTOCOLS:
+                            if '%s:%d:%s' % (ip, port, proto) not in existing:
+                                all_done = False
+                                break
+                        if all_done:
+                            continue
+                        chunk_futures.append((port, port_pool.submit(scan_fn, ip, port)))
                     
-                    if port_tasks[0] >= SHARD_MAX_REQUESTS and not stop_flag[0]:
-                        log('[!] 单分片探活次数达到 %d，触发换 IP 熔断！' % SHARD_MAX_REQUESTS)
-                        stop_flag[0] = True
-                        current_pos[0] = total_ips
+                    for port, fut in chunk_futures:
+                        if stop_flag[0]: return
+                        try:
+                            is_open, r_list = fut.result()
+                        except Exception:
+                            is_open, r_list = False, []
+                        if is_open:
+                            ip_has_open = True
+                            ip_open_count += 1
+                        if r_list:
+                            ip_has_proxy = True
+                            for item in r_list:
+                                ip_, port_, proto_ = item
+                                key = '%s:%d:%s' % (ip_, port_, proto_)
+                                with found_lock:
+                                    if key in existing: continue
+                                    existing.add(key)
+                                    found_count[0] += 1
+                                    ip_proxy_count += 1
+                                    if note:
+                                        line_out = '%s:%d@%s@%s' % (ip_, port_, proto_, note)
+                                    else:
+                                        line_out = '%s:%d@%s' % (ip_, port_, proto_)
+                                    with open(OUTPUT_FILE, 'a', encoding='utf-8', newline='') as f:
+                                        f.write(line_out + CRLF)
+                                    log('[+] ' + line_out)
+                        with found_lock:
+                            port_tasks[0] += 1
+                            
+                            if port_tasks[0] >= SHARD_MAX_REQUESTS and not stop_flag[0]:
+                                log('[!] 单分片探活次数达到 %d，触发换 IP 熔断！' % SHARD_MAX_REQUESTS)
+                                stop_flag[0] = True
+                                current_pos[0] = total_ips
+                                return
+                    if stop_flag[0]: return
+
+            else:
+                # common / revalidate / proxy 阶段，直接提交（端口少，不会堆积）
+                futures = []
+                for port in PORTS:
+                    all_done = True
+                    for proto in PROTOCOLS:
+                        if '%s:%d:%s' % (ip, port, proto) not in existing:
+                            all_done = False
+                            break
+                    if all_done:
+                        continue
+                    futures.append((port, port_pool.submit(scan_fn, ip, port)))
+
+                for port, fut in futures:
+                    if stop_flag[0]:
                         return
+                    try:
+                        is_open, r_list = fut.result()
+                    except Exception:
+                        is_open, r_list = False, []
+                    if is_open:
+                        ip_has_open = True
+                        ip_open_count += 1
+                    if r_list:
+                        ip_has_proxy = True
+                        for item in r_list:
+                            ip_, port_, proto_ = item
+                            key = '%s:%d:%s' % (ip_, port_, proto_)
+                            with found_lock:
+                                if key in existing:
+                                    continue
+                                existing.add(key)
+                                found_count[0] += 1
+                                ip_proxy_count += 1
+                                if note:
+                                    line_out = '%s:%d@%s@%s' % (ip_, port_, proto_, note)
+                                else:
+                                    line_out = '%s:%d@%s' % (ip_, port_, proto_)
+                                with open(OUTPUT_FILE, 'a', encoding='utf-8', newline='') as f:
+                                    f.write(line_out + CRLF)
+                                log('[+] ' + line_out)
+                    with found_lock:
+                        port_tasks[0] += 1
                         
-                    if current_phase == 'full' and processed_ports_for_ip % 10000 == 0:
-                        elapsed = time.time() - t0
-                        ppct = processed_ports_for_ip * 100.0 / total_ports_for_ip if total_ports_for_ip else 0
-                        log('[full] %s 端口 %d/%d (%.1f%%) | 开放 %d | 本片代理 %d | %.0f s'
-                            % (ip, processed_ports_for_ip, total_ports_for_ip,
-                               ppct, ip_open_count, found_count[0], elapsed))
-                if short_circuit and ip_has_open:
-                    break
+                        if port_tasks[0] >= SHARD_MAX_REQUESTS and not stop_flag[0]:
+                            log('[!] 单分片探活次数达到 %d，触发换 IP 熔断！' % SHARD_MAX_REQUESTS)
+                            stop_flag[0] = True
+                            current_pos[0] = total_ips
+                            return
+                    if short_circuit and ip_has_open:
+                        break
 
             if current_phase == 'common' and ip_has_open:
                 verify_futures = []
