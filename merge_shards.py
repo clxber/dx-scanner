@@ -6,14 +6,11 @@
 关键逻辑：
   - verify_existing：**替换** working_proxies.txt（只留仍有效的）
   - 其他阶段：**累积**（旧 + 新，去重）
-  - ★ 游标切片与防封禁：游标每次推进 BATCH_SIZE 个 IP（默认 30000），无缝换 IP 防止被封禁
-  - ★ 跨批次累积：存活 IP 明细（alive_ips.txt）每次生成前读取旧的并合并去重，确保历史存活 IP 不丢失
-  - ★ 【核心】common 阶段扫完：无论有无代理，一律推进游标（+ BATCH_SIZE），保持 common 阶段，继续扫下一批
-      - 防死循环：如果游标推进后或当前游标已经大于总IP数，直接收官，不触发下一轮
-  - ★ 【核心】全量扫完后的分流：游标走到尽头（触发 scan_finished.flag）时：
-      - 若已扫出代理，直接收官（省去全端口扫描）
-      - 若 0 代理，读取全局累积的 alive_ips.txt，均分给 8 个分片，统一切换到 full 阶段进行全端口深扫
-  - ★ 彻底收官：full 阶段完成或全量代理已扫出后，重置游标（归零），清理所有中间文件（含 artifacts）
+  - ★ 游标切片与防封禁：common 和 full 均支持游标切片，无缝换 IP 防止被封禁
+  - ★ 跨批次累积：存活 IP 明细（alive_ips.txt）每次生成前读取旧的并合并去重
+  - ★ 【核心】common 阶段扫完：推进游标，继续扫下一批
+  - ★ 【核心】full 阶段：如果未扫完，会保留 proxy_missing_shard 文件，继续接力
+  - ★ 彻底收官：全量代理已扫出，或 full 阶段彻底扫完后，重置游标，清理所有中间文件
 """
 
 import os
@@ -25,13 +22,10 @@ import re
 import ipaddress
 import shutil
 
-# ============ 核心调度参数（每次换学校请根据需要修改） ============
-# 每次触发 Actions 扫描的总 IP 数量（与 scanner.py 保持一致）
+# ============ 核心调度参数 ============
 BATCH_SIZE = 30000
-
-# 全局总探活次数熔断限额（与 scanner.py 保持一致，此处只用于日志展示或备用，实际熔断在 scanner.py 中执行）
 TOTAL_MAX_REQUESTS = 5500000
-# ===============================================================
+# ======================================
 
 SHARD_TOTAL = 8
 PHASE_FILE = 'phase.json'
@@ -120,6 +114,7 @@ def cleanup_shard_files():
         'open_ips_revalidated_shard*.txt',
         'proxy_missing_shard*.txt',
         'working_proxies_shard*.txt',
+        'full_cursor_shard*.json',  # ★ 新增清理 full 阶段游标
     ]
     removed = 0
     for pat in patterns:
@@ -344,7 +339,6 @@ def handle_verify_existing(phase_state):
 
 
 def main():
-    # ★ 收官逻辑：全量 IP 的 common 阶段扫完
     if os.path.exists(FINISHED_FLAG):
         log('=' * 60)
         log('✅ 检测到 scan_finished.flag，全量 IP 的 common 阶段已全部扫描完毕...')
@@ -357,7 +351,6 @@ def main():
 
         os.remove(FINISHED_FLAG)
         
-        # ★ 核心改动：先判断全量批次扫完后，有没有扫出代理
         current_count = count_file_lines(OUTPUT_FILE)
         if current_count > 0:
             log('全量扫描共找到 %d 个有效代理，已满足需求，直接收官！' % current_count)
@@ -373,7 +366,6 @@ def main():
             set_trigger('no')
             return
 
-        # 一个代理都没有，这才走 full 进行兜底
         if os.path.exists(ALIVE_IPS_FILE):
             alive_ips = []
             with open(ALIVE_IPS_FILE, 'r', encoding='utf-8', errors='ignore') as f:
@@ -407,7 +399,6 @@ def main():
                 set_trigger('yes')
                 return
 
-        # 如果没有存活 IP，直接彻底结束
         save_json(CURSOR_FILE, {'offset': 0})
         cleanup_shard_files()
         set_trigger('no')
@@ -504,7 +495,6 @@ def main():
         trigger = 'yes'
     else:
         if current_phase == 'common':
-            # ★ 核心修复：先判断游标是否已经到底了（防呆防死循环）
             all_ips_flat_count = 0
             if os.path.exists('ip_list.txt'):
                 with open('ip_list.txt', 'r', encoding='utf-8-sig', errors='ignore') as f:
@@ -516,7 +506,6 @@ def main():
             cursor_state = load_json(CURSOR_FILE) or {'offset': 0}
             current_offset = cursor_state.get('offset', 0)
             
-            # 如果当前游标加 BATCH_SIZE 已经大于总数，或者当前游标本身就大于总数了
             if current_offset >= all_ips_flat_count:
                 log('游标 %d >= 总IP数 %d，全量扫描已完毕，直接收官！' % (current_offset, all_ips_flat_count))
                 save_json(CURSOR_FILE, {'offset': 0})
@@ -571,7 +560,7 @@ def main():
                 trigger = 'yes'
 
         elif current_phase == 'full':
-            log('full 全部完成 → 结束')
+            log('full 全部分片扫完 → 结束')
             phase_state['full_completed'] = True
             save_json(PHASE_FILE, phase_state)
             trigger = 'no'
@@ -598,9 +587,8 @@ def main():
             log('working_proxies.txt 为空，下一轮从头开始')
 
         if current_phase == 'full':
-            # full 阶段结束，彻底收官，重置游标
             save_json(CURSOR_FILE, {'offset': 0})
-            log('已重置游标，全部收尾工作完成。')
+            log('已重置全局游标，全部收尾工作完成。')
             trigger = 'no'
 
         save_json(PHASE_FILE, {
