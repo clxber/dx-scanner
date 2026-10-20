@@ -2,6 +2,19 @@ name: Scan Proxies
 
 on:
   workflow_dispatch:
+    inputs:
+      batch_size:
+        description: 'common 阶段每次触发的 IP 数量（均分给8个分片）'
+        required: false
+        default: '30000'
+      full_batch_size:
+        description: 'full 阶段每次触发的 IP 数量（均分给8个分片）'
+        required: false
+        default: '10'
+      total_max_requests:
+        description: '全局总探活次数熔断限额'
+        required: false
+        default: '5500000'
 
 permissions:
   contents: write
@@ -30,6 +43,9 @@ jobs:
       - name: 运行扫描 分片0
         env:
           MAX_RUNTIME_SEC: '20880'
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '30000' }}
+          FULL_BATCH_SIZE: ${{ github.event.inputs.full_batch_size || '10' }}
+          TOTAL_MAX_REQUESTS: ${{ github.event.inputs.total_max_requests || '5500000' }}
         run: |
           ulimit -n 65536
           echo "ulimit -n = $(ulimit -n)"
@@ -94,6 +110,9 @@ jobs:
       - name: 运行扫描 分片1
         env:
           MAX_RUNTIME_SEC: '20880'
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '30000' }}
+          FULL_BATCH_SIZE: ${{ github.event.inputs.full_batch_size || '10' }}
+          TOTAL_MAX_REQUESTS: ${{ github.event.inputs.total_max_requests || '5500000' }}
         run: |
           ulimit -n 65536
           echo "ulimit -n = $(ulimit -n)"
@@ -158,6 +177,9 @@ jobs:
       - name: 运行扫描 分片2
         env:
           MAX_RUNTIME_SEC: '20880'
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '30000' }}
+          FULL_BATCH_SIZE: ${{ github.event.inputs.full_batch_size || '10' }}
+          TOTAL_MAX_REQUESTS: ${{ github.event.inputs.total_max_requests || '5500000' }}
         run: |
           ulimit -n 65536
           echo "ulimit -n = $(ulimit -n)"
@@ -222,6 +244,9 @@ jobs:
       - name: 运行扫描 分片3
         env:
           MAX_RUNTIME_SEC: '20880'
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '30000' }}
+          FULL_BATCH_SIZE: ${{ github.event.inputs.full_batch_size || '10' }}
+          TOTAL_MAX_REQUESTS: ${{ github.event.inputs.total_max_requests || '5500000' }}
         run: |
           ulimit -n 65536
           echo "ulimit -n = $(ulimit -n)"
@@ -286,6 +311,9 @@ jobs:
       - name: 运行扫描 分片4
         env:
           MAX_RUNTIME_SEC: '20880'
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '30000' }}
+          FULL_BATCH_SIZE: ${{ github.event.inputs.full_batch_size || '10' }}
+          TOTAL_MAX_REQUESTS: ${{ github.event.inputs.total_max_requests || '5500000' }}
         run: |
           ulimit -n 65536
           echo "ulimit -n = $(ulimit -n)"
@@ -350,6 +378,9 @@ jobs:
       - name: 运行扫描 分片5
         env:
           MAX_RUNTIME_SEC: '20880'
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '30000' }}
+          FULL_BATCH_SIZE: ${{ github.event.inputs.full_batch_size || '10' }}
+          TOTAL_MAX_REQUESTS: ${{ github.event.inputs.total_max_requests || '5500000' }}
         run: |
           ulimit -n 65536
           echo "ulimit -n = $(ulimit -n)"
@@ -414,6 +445,9 @@ jobs:
       - name: 运行扫描 分片6
         env:
           MAX_RUNTIME_SEC: '20880'
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '30000' }}
+          FULL_BATCH_SIZE: ${{ github.event.inputs.full_batch_size || '10' }}
+          TOTAL_MAX_REQUESTS: ${{ github.event.inputs.total_max_requests || '5500000' }}
         run: |
           ulimit -n 65536
           echo "ulimit -n = $(ulimit -n)"
@@ -478,6 +512,9 @@ jobs:
       - name: 运行扫描 分片7
         env:
           MAX_RUNTIME_SEC: '20880'
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '30000' }}
+          FULL_BATCH_SIZE: ${{ github.event.inputs.full_batch_size || '10' }}
+          TOTAL_MAX_REQUESTS: ${{ github.event.inputs.total_max_requests || '5500000' }}
         run: |
           ulimit -n 65536
           echo "ulimit -n = $(ulimit -n)"
@@ -635,6 +672,8 @@ jobs:
 
       - name: 合并结果
         if: always() && steps.check_cancel.outputs.is_cancelled == 'false'
+        env:
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '30000' }}
         run: python merge_shards.py
 
       - name: 提交合并
@@ -657,7 +696,10 @@ jobs:
           FLAG="$RUNNER_TEMP/trigger.flag"
           if [ -f "$FLAG" ] && [ "$(cat "$FLAG")" = "yes" ]; then
             echo "🔄 触发下一轮 workflow"
-            gh workflow run scan.yml --ref main
+            gh workflow run scan.yml --ref main \
+              -f batch_size="${{ github.event.inputs.batch_size || '30000' }}" \
+              -f full_batch_size="${{ github.event.inputs.full_batch_size || '10' }}" \
+              -f total_max_requests="${{ github.event.inputs.total_max_requests || '5500000' }}"
           else
             echo "✅ 结束，等待手动触发"
           fi
