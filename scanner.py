@@ -24,6 +24,7 @@
 ★ 参数全动态：BATCH_SIZE、FULL_BATCH_SIZE、TOTAL_MAX_REQUESTS 全部支持从环境变量读取
 ★ Bug 修复：使用 f_offset 对 full 阶段进行指纹校验，防止每批固定 IP 数引起的断点续跑错乱
 ★ 终极防御：使用 c_offset 对 common 阶段也进行指纹校验，彻底杜绝任何因为清理失败导致的秒退跳过
+★ 文案优化：将新切片日志精准区分为“批次扫描”，消除进度清零的误解
 """
 
 import os
@@ -771,8 +772,17 @@ def main():
             f.write('@ 验证: 读秀 https（单验证）' + CRLF)
             f.write('@' + '-' * 58 + CRLF)
         existing = set()
-        log('=== 新一轮扫描 [分片 %d/%d, phase=%s] ==='
-            % (SHARD_INDEX, SHARD_TOTAL, current_phase))
+        
+        # ★ 优化日志文案：叫“批次扫描”
+        if current_phase == 'common':
+            log('=== 批次扫描 (全局游标 %d) [分片 %d/%d, phase=%s] ==='
+                % (current_offset, SHARD_INDEX, SHARD_TOTAL, current_phase))
+        elif current_phase == 'full':
+            log('=== 批次扫描 (全端口游标 %d) [分片 %d/%d, phase=%s] ==='
+                % (f_offset, SHARD_INDEX, SHARD_TOTAL, current_phase))
+        else:
+            log('=== 批次扫描 [分片 %d/%d, phase=%s] ==='
+                % (SHARD_INDEX, SHARD_TOTAL, current_phase))
 
         if SHARD_INDEX == 0:
             try:
@@ -784,7 +794,7 @@ def main():
     else:
         state['session'] = state.get('session', 1) + 1
         existing = load_existing_proxies(OUTPUT_FILE)
-        log('=== 续跑 [分片 %d/%d, phase=%s, session %d] ==='
+        log('=== 断点续跑 [分片 %d/%d, phase=%s, session %d] ==='
             % (SHARD_INDEX, SHARD_TOTAL, current_phase, state['session']))
         log('上次位置: %d / %d (%.1f%%)'
             % (state['position'], total_ips,
