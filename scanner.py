@@ -21,6 +21,8 @@
 ★ 新增发包熔断：按 TOTAL_MAX_REQUESTS 限制，触发立即停止，严防高校防火墙封禁
 ★ 验证诊断：verify_existing 阶段打印详细的中文失败原因，一眼看出是代理挂了、超时、还是被读秀WAF拦截
 ★ Bug 修复：游标切片仅对 common 阶段生效，revalidate/proxy/full 直接读上游文件，彻底杜绝游标死锁
+★ 参数全动态：BATCH_SIZE、FULL_BATCH_SIZE、TOTAL_MAX_REQUESTS 全部支持从环境变量读取
+★ Bug 修复：使用 f_offset 对 full 阶段进行指纹校验，防止每批固定 IP 数引起的断点续跑错乱
 """
 
 import os
@@ -37,16 +39,16 @@ import ipaddress
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ============ 核心调度参数（每次换学校请根据需要修改） ============
+# ============ 核心调度参数（自动从环境变量读取，如果没有则用默认值） ============
 # common 阶段每次触发的 IP 数量（8 分片均分）
-BATCH_SIZE = 30000
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 30000))
 
-# full 阶段每次触发的 IP 数量（每个分片每次只扫 10 个 IP 的全端口）
-FULL_BATCH_SIZE = 10
+# full 阶段每次触发的 IP 数量（每个分片每次只扫 FULL_BATCH_SIZE 个 IP 的全端口）
+FULL_BATCH_SIZE = int(os.environ.get('FULL_BATCH_SIZE', 10))
 
 # 全局总探活次数熔断限额（单分片限额 = TOTAL_MAX_REQUESTS / 8 = 687500）
-TOTAL_MAX_REQUESTS = 5500000
-# ===============================================================
+TOTAL_MAX_REQUESTS = int(os.environ.get('TOTAL_MAX_REQUESTS', 5500000))
+# =================================================================================
 
 CURSOR_FILE = 'scan_cursor.json'
 FINISHED_FLAG = 'scan_finished.flag'
@@ -737,7 +739,12 @@ def main():
     if (state and not state.get('completed')
             and state.get('total_ips') == total_ips
             and state.get('phase') == current_phase):
-        new_round = False
+        # 针对 full 阶段：必须游标 f_offset 也能对上，才是真正的同一批任务续跑
+        if current_phase == 'full':
+            if state.get('f_offset') == f_offset:
+                new_round = False
+        else:
+            new_round = False
 
     if new_round:
         state = {
@@ -747,6 +754,9 @@ def main():
             'started_at': time.strftime('%Y-%m-%d %H:%M:%S'),
             'completed': False, 'session': 1,
         }
+        if current_phase == 'full':
+            state['f_offset'] = f_offset
+
         with open(OUTPUT_FILE, 'w', encoding='utf-8', newline='') as f:
             f.write('@ 代理扫描结果 [分片 %d/%d, 阶段 %s]'
                     % (SHARD_INDEX, SHARD_TOTAL, current_phase) + CRLF)
