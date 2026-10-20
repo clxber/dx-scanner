@@ -27,7 +27,7 @@ import shutil
 # ============ 核心调度参数（自动从环境变量读取） ============
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 30000))
 # 节约原则阈值：proxy 阶段找到多少条记录就跳过 full
-PROXY_THRESHOLD = int(os.environ.get('PROXY_THRESHOLD', 1))
+PROXY_THRESHOLD = int(os.environ.get('PROXY_THRESHOLD', 5))
 # ========================================================
 
 SHARD_TOTAL = 8
