@@ -19,6 +19,7 @@
 ★ 游标切片：按 BATCH_SIZE 切片，无缝换 IP 防止被防火墙封禁
 ★ 新增发包熔断：按 TOTAL_MAX_REQUESTS 限制，触发立即停止，严防高校防火墙封禁
 ★ 验证诊断：verify_existing 阶段打印详细的中文失败原因，一眼看出是代理挂了、超时、还是被读秀WAF拦截
+★ Bug 修复：游标切片仅对 common 阶段生效，revalidate/proxy/full 直接读上游文件，彻底杜绝游标死锁
 """
 
 import os
@@ -68,7 +69,6 @@ MAX_RUNTIME_SEC = int(os.environ.get('MAX_RUNTIME_SEC', 20880))
 def _build_probe_ports_12():
     return [22, 80, 443, 3389, 1080, 1081, 8080, 8081, 7890, 3128, 8000, 8443]
 
-
 def _build_proxy_ports():
     groups = [
         (1080, 1090), (10808, 10820), (7890, 7899), (8080, 8090),
@@ -76,14 +76,16 @@ def _build_proxy_ports():
         (10000, 10010), (10080, 10086), (3128, 3130), (8388, 8389),
         (8443, 8444), (2052, 2096), (51820, 51830), (1194, 1199),
         (9050, 9051), (9150, 9151),
+        # ★ 根据真实代理列表，新增独立端口
         (15732, 15732), (26001, 26001), (29290, 29290),
         (10090, 10090), (17891, 17891), (10792, 10792),
+        (8429, 8429), (10684, 10684), (16699, 16699),
+        (8902, 8902), (18080, 18080), (17897, 17897),
     ]
     s = set()
     for a, b in groups:
         s.update(range(a, b + 1))
     return sorted(s)
-
 
 def _build_common_ports():
     probe12 = _build_probe_ports_12()
@@ -99,7 +101,6 @@ def _build_common_ports():
             seen.add(p)
             result.append(p)
     return result
-
 
 PROBE_PORTS_12 = _build_probe_ports_12()
 PROXY_PORTS = _build_proxy_ports()
@@ -377,18 +378,6 @@ def _build_curl_args(ip, port, protocol, url):
     return None
 
 
-def _text_contains_any(raw, keywords, excludes):
-    try:
-        text = raw.decode('utf-8', errors='ignore')
-    except Exception:
-        return False
-    if any(ex in text for ex in excludes):
-        return False
-    if any(kw in text for kw in keywords):
-        return True
-    return False
-
-
 def _verify_one_url(ip, port, protocol, url, keywords, excludes):
     args = _build_curl_args(ip, port, protocol, url)
     if args is None:
@@ -641,55 +630,64 @@ def main():
         run_verify_existing_phase()
         return
 
-    all_ranges = load_ip_ranges(INPUT_FILE)
-    if not all_ranges:
-        log('未读取到有效 IP 范围')
-        sys.exit(1)
-
-    # ★ 展开所有 IP，根据游标切片
-    all_ips_flat = expand_ranges_to_ips(all_ranges)
-    total_all_ips = len(all_ips_flat)
-    
-    cursor_state = load_json(CURSOR_FILE) or {'offset': 0}
-    current_offset = cursor_state.get('offset', 0)
-    
     PORTS, upstream_file, output_filter_file = get_phase_config(current_phase)
 
-    if current_offset >= total_all_ips:
-        log('游标 %d >= 总IP数 %d，全部扫描完毕。' % (current_offset, total_all_ips))
-        if SHARD_INDEX == 0:
-            with open(FINISHED_FLAG, 'w') as f:
-                f.write('yes')
-        _skip_this_shard(STATE_FILE, output_filter_file, current_phase, 0)
-        return
+    ip_list = []
+    current_offset = 0
+    total_all_ips = 0
 
-    batch_end = min(current_offset + BATCH_SIZE, total_all_ips)
-    batch_ips = all_ips_flat[current_offset:batch_end]
-    log('当前批次游标: %d ~ %d，本批次共 %d 个 IP' % (current_offset, batch_end, len(batch_ips)))
+    if current_phase == 'common':
+        # ============ common 阶段：游标切片逻辑 ============
+        all_ranges = load_ip_ranges(INPUT_FILE)
+        if not all_ranges:
+            log('未读取到有效 IP 范围')
+            sys.exit(1)
 
-    # 按分片切分这批 IP
-    total_in_batch = len(batch_ips)
-    shard_size = (total_in_batch + SHARD_TOTAL - 1) // SHARD_TOTAL
-    lo = SHARD_INDEX * shard_size
-    hi = min(lo + shard_size, total_in_batch)
-    my_ips = batch_ips[lo:hi]
-    
-    ip_list = my_ips
+        all_ips_flat = expand_ranges_to_ips(all_ranges)
+        total_all_ips = len(all_ips_flat)
+        
+        cursor_state = load_json(CURSOR_FILE) or {'offset': 0}
+        current_offset = cursor_state.get('offset', 0)
+        
+        if current_offset >= total_all_ips:
+            log('游标 %d >= 总IP数 %d，全部扫描完毕。' % (current_offset, total_all_ips))
+            if SHARD_INDEX == 0:
+                with open(FINISHED_FLAG, 'w') as f:
+                    f.write('yes')
+            _skip_this_shard(STATE_FILE, output_filter_file, current_phase, 0)
+            return
 
-    if upstream_file is not None:
-        if os.path.exists(upstream_file):
+        batch_end = min(current_offset + BATCH_SIZE, total_all_ips)
+        batch_ips = all_ips_flat[current_offset:batch_end]
+        log('当前批次游标: %d ~ %d，本批次共 %d 个 IP' % (current_offset, batch_end, len(batch_ips)))
+
+        total_in_batch = len(batch_ips)
+        shard_size = (total_in_batch + SHARD_TOTAL - 1) // SHARD_TOTAL
+        lo = SHARD_INDEX * shard_size
+        hi = min(lo + shard_size, total_in_batch)
+        ip_list = batch_ips[lo:hi]
+        
+    else:
+        # ============ revalidate / proxy / full 阶段：直接读上游分片文件，不受游标限制 ============
+        if upstream_file is not None and os.path.exists(upstream_file):
             wanted = load_ip_set(upstream_file)
             if wanted:
-                before = len(ip_list)
-                ip_list = [(ip_int, note) for (ip_int, note) in ip_list if ip_int_to_str(ip_int) in wanted]
-                log('[%s] 上游过滤 (%s): %d → %d'
-                    % (current_phase, upstream_file, before, len(ip_list)))
-                if current_phase == 'revalidate':
-                    ip_note_map = {}
-                    for ip_int, note in my_ips:
-                        if note:
-                            ip_note_map[ip_int] = note
-                    ip_list = [(ip_int, ip_note_map.get(ip_int, '')) for ip_int, _ in ip_list]
+                all_ranges = []
+                if os.path.exists(INPUT_FILE):
+                    all_ranges = load_ip_ranges(INPUT_FILE)
+                
+                for w in wanted:
+                    try:
+                        ip_int = int(ipaddress.IPv4Address(w))
+                    except Exception:
+                        continue
+                    note = ''
+                    for s, e, n in all_ranges:
+                        if s <= ip_int <= e:
+                            note = n
+                            break
+                    ip_list.append((ip_int, note))
+                log('[%s] 从上游文件 %s 加载了 %d 个 IP' % (current_phase, upstream_file, len(ip_list)))
             else:
                 log('[%s] 上游文件为空，本片无待扫 IP，跳过' % current_phase)
                 _skip_this_shard(STATE_FILE, output_filter_file, current_phase, len(PORTS))
@@ -701,6 +699,10 @@ def main():
             return
 
     total_ips = len(ip_list)
+    if total_ips == 0:
+        log('[%s] 无待扫 IP，跳过' % current_phase)
+        _skip_this_shard(STATE_FILE, output_filter_file, current_phase, len(PORTS))
+        return
 
     def ip_at_position(pos):
         return ip_list[pos]
@@ -775,7 +777,11 @@ def main():
         log('  前 12 探针: %s' % PROBE_PORTS_12)
     
     # ★ 日志展示全量视角
-    log('本次起点: 本片 IP #%d (全局游标 #%d / 总 %d)' % (state['position'], current_offset, total_all_ips))
+    if current_phase == 'common':
+        log('本次起点: 本片 IP #%d (全局游标 #%d / 总 %d)' % (state['position'], current_offset, total_all_ips))
+    else:
+        log('本次起点: 本片 IP #%d (来源: %s)' % (state['position'], upstream_file))
+        
     log('已找到代理: 全局累积 %d 个 | 本片已有 %d 个' % (global_proxy_count, len(existing)))
     log('历史存活 IP 累积: %d 个' % history_alive_count)
     
