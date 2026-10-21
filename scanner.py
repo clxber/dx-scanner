@@ -28,10 +28,14 @@
 ★ 参数全动态：BATCH_SIZE、FULL_BATCH_SIZE、TOTAL_MAX_REQUESTS 全部支持从环境变量读取
 ★ Bug 修复：使用 f_offset 对 full 阶段进行指纹校验，防止每批固定 IP 数引起的断点续跑错乱
 ★ 终极防御：使用 c_offset 对 common 阶段也进行指纹校验，彻底杜绝任何因为清理失败导致的秒退跳过
-★ 文案优化：将新切片日志精准区分为“批次扫描”，消除进度清零的误解
-★ 视觉归零：当全局游标为 0 时，日志展示的历史累积 IP 强制归零，契合“重头开始”的直觉
+★ 文案优化：将新切片日志精准区分为"批次扫描"，消除进度清零的误解
+★ 视觉归零：当全局游标为 0 时，日志展示的历史累积 IP 强制归零，契合"重头开始"的直觉
 ★ 性能重构：full 阶段采用滑动窗口分批提交（每次 5000 个端口），既压满 2000 并发，又防止内存/GIL假死
 ★ 战利品入库：将中科大实测有效端口 3123 加入常用代理端口池
+★ 神来一笔：full 开拔前置全量探活 —— 进入 full 阶段时一次性用 1000 并发把上游全部待深扫 IP 的
+  188 个常用端口探一遍，几秒钟剔除死 IP，生成纯净的 full_alive_shardN.txt 存活名单，再用这份
+  名单去跑 10 个一批的接力深扫，省下海量 GitHub Actions 接力轮次与运行额度。幂等：文件存在即复用。
+★ Bug 修复：状态文件写入 all_upstream_ips_len，供 merge_shards.py 精准判定 full 游标是否到达终点。
 """
 
 import os
@@ -49,13 +53,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============ 核心调度参数（自动从环境变量读取，如果没有则用默认值） ============
-# common 阶段每次触发的 IP 数量（8 分片均分）
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 30000))
-
-# full 阶段每次触发的 IP 数量（每个分片每次只扫 FULL_BATCH_SIZE 个 IP 的全端口）
 FULL_BATCH_SIZE = int(os.environ.get('FULL_BATCH_SIZE', 10))
-
-# 全局总探活次数熔断限额（单分片限额 = TOTAL_MAX_REQUESTS / 8 = 687500）
 TOTAL_MAX_REQUESTS = int(os.environ.get('TOTAL_MAX_REQUESTS', 5500000))
 # =================================================================================
 
@@ -64,7 +63,6 @@ FINISHED_FLAG = 'scan_finished.flag'
 
 # ============ 配置 ============
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-# ★ 优化：极速超时，假死代理不配等 30 秒
 CONNECT_TIMEOUT = 10
 MAX_TIME = 20
 
@@ -647,7 +645,7 @@ def main():
 
     PORTS, upstream_file, output_filter_file = get_phase_config(current_phase)
 
-    # ============ ★ 核心优化：full 阶段前置过滤死 IP ============
+    # ============ ★ 神来一笔：full 阶段开拔前置全量探活 ============
     if current_phase == 'full' and upstream_file is not None:
         if not os.path.exists(FULL_ALIVE_FILE):
             log('[full] 发现未过滤的深扫名单，开始启动 188 端口全量前置探活...')
@@ -661,7 +659,6 @@ def main():
 
                 alive_list = []
                 t_start = time.time()
-                # 使用 1000 并发去跑这 188 个端口的探活
                 with ThreadPoolExecutor(max_workers=1000) as executor:
                     futures = {executor.submit(check_ip_alive, ip): ip for ip in wanted}
                     for fut in as_completed(futures):
@@ -683,7 +680,6 @@ def main():
                     pass
                 log('[full] 上游名单为空，探活过滤直接跳过')
         
-        # 将上游文件指针切换为过滤后的文件
         upstream_file = FULL_ALIVE_FILE
     # =============================================================
 
@@ -830,6 +826,7 @@ def main():
         }
         if current_phase == 'full':
             state['f_offset'] = f_offset
+            state['all_upstream_ips_len'] = all_upstream_ips_len
         elif current_phase == 'common':
             state['c_offset'] = current_offset
 
@@ -841,7 +838,7 @@ def main():
             f.write('@' + '-' * 58 + CRLF)
         existing = set()
         
-        # ★ 优化日志文案：叫“批次扫描”
+        # ★ 优化日志文案：叫"批次扫描"
         if current_phase == 'common':
             log('=== 批次扫描 (全局游标 %d) [分片 %d/%d, phase=%s] ==='
                 % (current_offset, SHARD_INDEX, SHARD_TOTAL, current_phase))
@@ -1274,9 +1271,7 @@ def main():
             log('[!] 写待深扫文件失败: %s' % e)
 
     if current_phase == 'full':
-        # ★ 核心修复：只有在这批 IP 彻底扫完时，才推进游标！
-        # 如果是因为熔断中断的（state['completed'] == False），游标原地不动，
-        # 下一轮重新拉起时会继续从 f_offset 开始取这一批 IP，结合 progress 文件实现无缝接力。
+        state['all_upstream_ips_len'] = all_upstream_ips_len
         if state.get('completed'):
             fc_state = load_json(FULL_CURSOR_FILE) or {'offset': 0}
             fc_state['offset'] += len(ip_list)
