@@ -9,7 +9,7 @@
   - ★ 游标切片与防封禁：common 和 full 均支持游标切片，无缝换 IP 防止被封禁
   - ★ 跨批次累积：存活 IP 明细（alive_ips.txt）每次生成前读取旧的并合并去重
   - ★ 【核心】common 阶段扫完：推进游标，继续扫下一批
-  - ★ 【核心】full 阶段：如果未扫完，会保留 proxy_missing_shard 文件，继续接力
+  - ★ 【核心】full 阶段：如果游标未到总长度，保留游标继续接力
   - ★ 节约原则：proxy 阶段找到多少个代理就跳过 full，阈值可配置
   - ★ 彻底收官：全量代理已扫出，或 full 阶段彻底扫完后，重置游标，清理所有中间文件
   - ★ 物理归零：当从头开始（游标 0）合并时，抛弃旧的 alive_ips.txt，彻底重头统计
@@ -124,7 +124,7 @@ def cleanup_shard_files():
         'proxy_missing_shard*.txt',
         'working_proxies_shard*.txt',
         'full_cursor_shard*.json',
-        'full_alive_shard*.txt', # ★ 新增：清理 full 阶段的存活名单
+        'full_alive_shard*.txt',
     ]
     removed = 0
     for pat in patterns:
@@ -364,7 +364,6 @@ def main():
         log('=' * 60)
         
         try:
-            # 全量收尾，这里肯定不用 ignore_old，因为要把所有的汇总
             build_alive_ip_ranges(ignore_old=False)
         except Exception as e:
             log('[!] 最终汇总失败: %s' % e)
@@ -535,7 +534,6 @@ def main():
             else:
                 log('common 阶段完成，存活 IP %d，有代理的 IP %d → 暂存存活 IP，推进游标开启下一批' % (total_open, total_proxy_ips))
                 try:
-                    # ★ 物理归零：如果是第一波（游标 0），不要合并历史记录，重头开始统计
                     if current_offset == 0:
                         build_alive_ip_ranges(ignore_old=True)
                     else:
@@ -584,11 +582,37 @@ def main():
                 trigger = 'yes'
 
         elif current_phase == 'full':
-            log('full 全部分片扫完 → 结束')
-            phase_state['full_completed'] = True
-            save_json(PHASE_FILE, phase_state)
-            trigger = 'no'
-            should_cleanup = True
+            # ★ 核心修复：不能只看 completed，必须检查每个分片的 f_offset 是否达到 all_upstream_ips_len
+            all_full_done = True
+            for i in range(SHARD_TOTAL):
+                st = load_json('progress_shard%d.json' % i)
+                if not st:
+                    all_full_done = False
+                    break
+                
+                if not st.get('completed'):
+                    all_full_done = False
+                    break
+                
+                f_offset = st.get('f_offset', 0)
+                all_len = st.get('all_upstream_ips_len', 0)
+                
+                if f_offset < all_len:
+                    all_full_done = False
+                    log('分片 %d 游标未到终点: %d / %d' % (i, f_offset, all_len))
+                    break
+                    
+            if all_full_done:
+                log('full 全部分片扫完（游标全部到达终点） → 结束')
+                phase_state['full_completed'] = True
+                save_json(PHASE_FILE, phase_state)
+                trigger = 'no'
+                should_cleanup = True
+            else:
+                log('full 阶段本批次完成，但游标未到终点，继续接力下一轮')
+                phase_state['current'] = 'full'
+                save_json(PHASE_FILE, phase_state)
+                trigger = 'yes'
 
     if should_cleanup:
         log('=' * 60)
