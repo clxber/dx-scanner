@@ -3,11 +3,11 @@
 高校代理扫描器 —— 五阶段 + 分片 + 断点续跑
 
 阶段 1 verify_existing：验证已有代理（只有分片 0 干活）
-阶段 2 common         ：12 探针 + 183 代理（TCP 探活，IP 级短路）+ 顺便代理验证
+阶段 2 common         ：12 探针 + 176 代理（TCP 探活，IP 级短路）+ 顺便代理验证
                         → 输出 open_ips_shardN.txt（所有存活 IP）
                         → 输出 proxy_ips_shardN.txt（有代理的 IP，供 revalidate 用）
 阶段 3 revalidate     ：对 proxy_ips_shardN.txt（有代理的 IP）二次探活
-阶段 4 proxy          ：183 代理端口（完整扫描 + 单验证，3 协议全试）
+阶段 4 proxy          ：176 代理端口（完整扫描 + 单验证，3 协议全试）
 阶段 5 full           ：65535 全端口（只扫 proxy 未找到代理的 IP）
 
 验证：单验证 —— 读秀（https://www.duxiu.com/），命中「读秀学术搜索」才算有效代理
@@ -16,6 +16,7 @@
 ★ 极限并发：80×25 = 2000 并发（实测 2500 task/s）
 ★ 彻底取消验证限速（VERIFY_RATE_LIMIT=0），且内嵌验证并发，解决串行卡 35 分钟的问题
 ★ full 前置探活：全端口前先探 COMMON_PORTS（188个），若全闭直接跳过，防止死 IP 浪费时间
+★ 全端口开拔前置过滤：进入 full 阶段时，一次性并发探活所有待深扫 IP，剔除死 IP 后再进行 10 个一批的接力
 ★ 游标切片：按 BATCH_SIZE 切片，无缝换 IP 防止被防火墙封禁
 ★ full 游标切片：按 FULL_BATCH_SIZE=10 切片，单次扫 65 万次，彻底杜绝熔断误伤
 ★ 新增发包熔断：按 TOTAL_MAX_REQUESTS 限制，触发立即停止，严防高校防火墙封禁
@@ -151,6 +152,7 @@ if SHARD_TOTAL > 1:
     OPEN_IPS_REVALIDATED_FILE = 'open_ips_revalidated_shard%d.txt' % SHARD_INDEX
     PROXY_MISSING_FILE = 'proxy_missing_shard%d.txt' % SHARD_INDEX
     FULL_CURSOR_FILE = 'full_cursor_shard%d.json' % SHARD_INDEX
+    FULL_ALIVE_FILE = 'full_alive_shard%d.txt' % SHARD_INDEX
 else:
     STATE_FILE = 'progress.json'
     OUTPUT_FILE = 'working_proxies.txt'
@@ -159,6 +161,7 @@ else:
     OPEN_IPS_REVALIDATED_FILE = 'open_ips_revalidated.txt'
     PROXY_MISSING_FILE = 'proxy_missing.txt'
     FULL_CURSOR_FILE = 'full_cursor.json'
+    FULL_ALIVE_FILE = 'full_alive.txt'
 
 CRLF = '\r\n'
 EXISTING_PROXIES_FILE = 'working_proxies.txt'
@@ -643,6 +646,46 @@ def main():
         return
 
     PORTS, upstream_file, output_filter_file = get_phase_config(current_phase)
+
+    # ============ ★ 核心优化：full 阶段前置过滤死 IP ============
+    if current_phase == 'full' and upstream_file is not None:
+        if not os.path.exists(FULL_ALIVE_FILE):
+            log('[full] 发现未过滤的深扫名单，开始启动 188 端口全量前置探活...')
+            wanted = load_ip_set(upstream_file)
+            if wanted:
+                def check_ip_alive(w_ip):
+                    for p in COMMON_PORTS:
+                        if tcp_check(w_ip, p, timeout=0.5):
+                            return True
+                    return False
+
+                alive_list = []
+                t_start = time.time()
+                # 使用 1000 并发去跑这 188 个端口的探活
+                with ThreadPoolExecutor(max_workers=1000) as executor:
+                    futures = {executor.submit(check_ip_alive, ip): ip for ip in wanted}
+                    for fut in as_completed(futures):
+                        w_ip = futures[fut]
+                        try:
+                            if fut.result():
+                                alive_list.append(w_ip)
+                        except Exception:
+                            pass
+                
+                with open(FULL_ALIVE_FILE, 'w', encoding='utf-8', newline='') as f:
+                    for w_ip in alive_list:
+                        f.write(w_ip + CRLF)
+                
+                log('[full] 前置探活完成！存活 %d/%d 个，耗时 %.1f 秒' 
+                    % (len(alive_list), len(wanted), time.time() - t_start))
+            else:
+                with open(FULL_ALIVE_FILE, 'w', encoding='utf-8', newline='') as f:
+                    pass
+                log('[full] 上游名单为空，探活过滤直接跳过')
+        
+        # 将上游文件指针切换为过滤后的文件
+        upstream_file = FULL_ALIVE_FILE
+    # =============================================================
 
     ip_list = []
     current_offset = 0
