@@ -124,6 +124,7 @@ def cleanup_shard_files():
         'proxy_missing_shard*.txt',
         'working_proxies_shard*.txt',
         'full_cursor_shard*.json',
+        'full_alive_shard*.txt', # ★ 新增：清理 full 阶段的存活名单
     ]
     removed = 0
     for pat in patterns:
