@@ -5,10 +5,10 @@
   "phase": "full",
   "shard_index": 4,
   "shard_total": 8,
-  "started_at": "2026-10-22 18:14:37",
+  "started_at": "2026-10-22 18:23:19",
   "completed": true,
   "session": 1,
-  "f_offset": 610,
+  "f_offset": 620,
   "all_upstream_ips_len": 1195,
-  "completed_at": "2026-10-22 18:19:36"
+  "completed_at": "2026-10-22 18:27:22"
 }
