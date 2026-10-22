@@ -40,7 +40,7 @@
 ★ 游标稳定性重构：游标底座永远锁定为 proxy_missing_shardN.txt，绝不因为探活结果变化而导致游标错位。
   前置探活结果 full_alive_shardN.txt 仅作为“通行证”，切出来的 IP 若在通行证外，直接秒跳，游标依然稳定推进。
   同时引入 load_ip_list 强制排序，彻底消除 set 无序导致的随机切片 Bug。
-★ 动态时间熔断：单 IP 扫描超过 600 秒 (MAX_IP_TIME = 10 分钟) 且未发现任何代理，直接判定为高防假死IP，提前 break 放弃，防止单 IP 拖垮全片。
+★ 动态时间熔断：单 IP 扫描超过 300 秒 (MAX_IP_TIME = 5 分钟) 且未发现任何代理，直接判定为高防假死IP，提前 break 放弃，防止单 IP 拖垮全片。
 """
 
 import os
@@ -70,7 +70,7 @@ FINISHED_FLAG = 'scan_finished.flag'
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 CONNECT_TIMEOUT = 5
 MAX_TIME = 8
-MAX_IP_TIME = 600  # ★ 单 IP 最大耗时 600 秒(10分钟)，超过直接放弃
+MAX_IP_TIME = 300  # ★ 单 IP 最大耗时 300 秒(5分钟)，超过直接放弃
 
 VERIFY_TARGETS = [
     {
@@ -1046,7 +1046,7 @@ def main():
             if current_phase == 'full':
                 chunk_size = 5000
                 for i in range(0, len(PORTS), chunk_size):
-                    # ★ 动态时间熔断：如果单 IP 耗时超过 600 秒(10分钟)且没代理，直接放弃
+                    # ★ 动态时间熔断：如果单 IP 耗时超过 300 秒(5分钟)且没代理，直接放弃
                     if time.time() - ip_start_time > MAX_IP_TIME and ip_proxy_count == 0:
                         log('[full] IP %s 耗时超过 %d s 仍无代理，判定为高防/假死鸡，提前放弃剩余端口' % (ip, MAX_IP_TIME))
                         break
