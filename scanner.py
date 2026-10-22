@@ -40,7 +40,8 @@
 ★ 游标稳定性重构：游标底座永远锁定为 proxy_missing_shardN.txt，绝不因为探活结果变化而导致游标错位。
   前置探活结果 full_alive_shardN.txt 仅作为“通行证”，切出来的 IP 若在通行证外，直接秒跳，游标依然稳定推进。
   同时引入 load_ip_list 强制排序，彻底消除 set 无序导致的随机切片 Bug。
-★ 动态时间熔断：单 IP 扫描超过 300 秒 (MAX_IP_TIME = 5 分钟) 且未发现任何代理，直接判定为高防假死IP，提前 break 放弃，防止单 IP 拖垮全片。
+★ 动态时间熔断（仅限 full 阶段）：单 IP 扫描超过 300 秒 (MAX_IP_TIME = 5 分钟) 且未发现任何代理，直接判定为高防假死IP，提前 break 放弃剩余端口，防止单 IP 拖垮全片。
+★ 日志增强（仅限 full 阶段）：单个 IP 扫完时打印该 IP 的专属耗时；触发 5 分钟熔断时打印带有 [!] 的强制熔断警告。
 """
 
 import os
@@ -70,7 +71,7 @@ FINISHED_FLAG = 'scan_finished.flag'
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 CONNECT_TIMEOUT = 5
 MAX_TIME = 8
-MAX_IP_TIME = 300  # ★ 单 IP 最大耗时 300 秒(5分钟)，超过直接放弃
+MAX_IP_TIME = 300  # ★ 单 IP 最大耗时 300 秒(5分钟)，仅针对 full 阶段生效
 
 VERIFY_TARGETS = [
     {
@@ -1048,7 +1049,7 @@ def main():
                 for i in range(0, len(PORTS), chunk_size):
                     # ★ 动态时间熔断：如果单 IP 耗时超过 300 秒(5分钟)且没代理，直接放弃
                     if time.time() - ip_start_time > MAX_IP_TIME and ip_proxy_count == 0:
-                        log('[full] IP %s 耗时超过 %d s 仍无代理，判定为高防/假死鸡，提前放弃剩余端口' % (ip, MAX_IP_TIME))
+                        log('[!] [full] IP %s 耗时超过 %d s (5分钟) 仍无代理，判定为高防/假死黑洞，强制熔断放弃剩余端口！' % (ip, MAX_IP_TIME))
                         break
 
                     chunk_ports = PORTS[i:i+chunk_size]
@@ -1202,11 +1203,12 @@ def main():
                 processed_ips[0] += 1
                 real_done = start_position + processed_ips[0]
                 pct = real_done * 100.0 / total_ips if total_ips else 0
+                ip_elapsed = time.time() - ip_start_time  # ★ 计算该 IP 自己的耗时
                 if current_phase == 'full':
                     elapsed = time.time() - t0
                     speed = port_tasks[0] / elapsed if elapsed > 0 else 0
-                    log('[full] IP #%d %s 扫完 | 本 IP: 端口开放 %d, 代理 %d | 本片 %d/%d (%.2f%%) | 累计代理 %d | %.1f task/s | %.0f s'
-                        % (real_done, ip, ip_open_count, ip_proxy_count,
+                    log('[full] IP #%d %s 扫完 | 本 IP 耗时 %.0f s | 端口开放 %d, 代理 %d | 本片 %d/%d (%.2f%%) | 累计代理 %d | %.1f task/s | %.0f s'
+                        % (real_done, ip, ip_elapsed, ip_open_count, ip_proxy_count,
                            real_done, total_ips, pct,
                            found_count[0], speed, elapsed))
                 elif processed_ips[0] % 200 == 0:
