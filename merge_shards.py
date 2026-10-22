@@ -14,6 +14,7 @@
   - ★ 彻底收官：全量代理已扫出，或 full 阶段彻底扫完后，重置游标，清理所有中间文件
   - ★ 物理归零：当从头开始（游标 0）合并时，抛弃旧的 alive_ips.txt，彻底重头统计
   - ★ 游标封顶：推进游标时，绝不超越实际总 IP 数（如 65536），防止出现 90000 这种虚高数字
+  - ★ Bug 修复：scan_finished.flag 判定加入阈值对比，未达 PROXY_THRESHOLD 时即使有代理也切 full 兜底。
 """
 
 import os
@@ -371,8 +372,10 @@ def main():
         os.remove(FINISHED_FLAG)
         
         current_count = count_file_lines(OUTPUT_FILE)
-        if current_count > 0:
-            log('全量扫描共找到 %d 个有效代理，已满足需求，直接收官！' % current_count)
+        
+        # ★ 核心修复：判断是否达到 PROXY_THRESHOLD 阈值
+        if current_count >= PROXY_THRESHOLD:
+            log('全量扫描共找到 %d 个有效代理（达到阈值 %d），已满足需求，直接收官！' % (current_count, PROXY_THRESHOLD))
             save_json(CURSOR_FILE, {'offset': 0})
             cleanup_shard_files()
             save_json(PHASE_FILE, {
@@ -396,7 +399,8 @@ def main():
                     alive_ips.append(ip_str)
             
             if alive_ips:
-                log('全量扫描 0 代理，但累积了 %d 个存活 IP，准备切换至 full 阶段进行全端口深扫...' % len(alive_ips))
+                log('全量扫描共找到 %d 个有效代理（未达阈值 %d），但累积了 %d 个存活 IP，准备切换至 full 阶段进行全端口深扫...' 
+                    % (current_count, PROXY_THRESHOLD, len(alive_ips)))
                 shard_size = (len(alive_ips) + SHARD_TOTAL - 1) // SHARD_TOTAL
                 for i in range(SHARD_TOTAL):
                     lo = i * shard_size
@@ -582,7 +586,6 @@ def main():
                 trigger = 'yes'
 
         elif current_phase == 'full':
-            # ★ 核心修复：不能只看 completed，必须检查每个分片的 f_offset 是否达到 all_upstream_ips_len
             all_full_done = True
             for i in range(SHARD_TOTAL):
                 st = load_json('progress_shard%d.json' % i)
