@@ -37,6 +37,9 @@
   名单去跑 10 个一批的接力深扫，省下海量 GitHub Actions 接力轮次与运行额度。幂等：文件存在即复用。
 ★ 自动分片切分：当处于 full 阶段且 proxy_missing_shardN.txt 不存在时，自动读取全局 alive_ips.txt
   并按 1/8 均分生成对应分片文件，省去手动切分文件的痛苦，也省去了为了触发代码自动切分而重置游标重跑 common 阶段的麻烦！
+★ 游标稳定性重构：游标底座永远锁定为 proxy_missing_shardN.txt，绝不因为探活结果变化而导致游标错位。
+  前置探活结果 full_alive_shardN.txt 仅作为“通行证”，切出来的 IP 若在通行证外，直接秒跳，游标依然稳定推进。
+  同时引入 load_ip_list 强制排序，彻底消除 set 无序导致的随机切片 Bug。
 """
 
 import os
@@ -315,6 +318,7 @@ def load_proxy_list(path):
 
 
 def load_ip_set(path):
+    """仅用于不关心顺序的场景，比如判断某个 IP 是否在集合内"""
     s = set()
     if not os.path.exists(path):
         return s
@@ -327,6 +331,22 @@ def load_ip_set(path):
     except Exception:
         pass
     return s
+
+
+def load_ip_list(path):
+    """★ 核心稳定性修复：用于游标切片的场景，必须保证列表有序，绝不能是 set"""
+    s = set()
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    s.add(line)
+    except Exception:
+        pass
+    return sorted(list(s))
 
 
 def load_json(path):
@@ -669,11 +689,12 @@ def main():
                 log('[full] 自动切分完成！本片分得 %d 个 IP，已保存至 %s' % (len(my_ips), upstream_file))
 
     # ============ ★ 神来一笔：full 阶段开拔前置全量探活 ============
+    full_alive_set = None
     if current_phase == 'full' and upstream_file is not None:
         if not os.path.exists(FULL_ALIVE_FILE):
             log('[full] 发现未过滤的深扫名单，开始启动 188 端口全量前置探活...')
-            wanted = load_ip_set(upstream_file)
-            if wanted:
+            wanted_for_probe = load_ip_list(upstream_file)
+            if wanted_for_probe:
                 def check_ip_alive(w_ip):
                     for p in COMMON_PORTS:
                         if tcp_check(w_ip, p, timeout=0.5):
@@ -683,7 +704,7 @@ def main():
                 alive_list = []
                 t_start = time.time()
                 with ThreadPoolExecutor(max_workers=1000) as executor:
-                    futures = {executor.submit(check_ip_alive, ip): ip for ip in wanted}
+                    futures = {executor.submit(check_ip_alive, ip): ip for ip in wanted_for_probe}
                     for fut in as_completed(futures):
                         w_ip = futures[fut]
                         try:
@@ -697,13 +718,14 @@ def main():
                         f.write(w_ip + CRLF)
                 
                 log('[full] 前置探活完成！存活 %d/%d 个，耗时 %.1f 秒' 
-                    % (len(alive_list), len(wanted), time.time() - t_start))
+                    % (len(alive_list), len(wanted_for_probe), time.time() - t_start))
             else:
                 with open(FULL_ALIVE_FILE, 'w', encoding='utf-8', newline='') as f:
                     pass
                 log('[full] 上游名单为空，探活过滤直接跳过')
         
-        upstream_file = FULL_ALIVE_FILE
+        # ★ 核心修复：只作为通行证读取，绝不修改 upstream_file 指针
+        full_alive_set = load_ip_set(FULL_ALIVE_FILE)
 
     ip_list = []
     current_offset = 0
@@ -744,7 +766,8 @@ def main():
         
     else:
         if upstream_file is not None and os.path.exists(upstream_file):
-            wanted = load_ip_set(upstream_file)
+            # ★ 核心稳定性修复：使用 load_ip_list 保证切片顺序绝对稳定
+            wanted = load_ip_list(upstream_file)
             if wanted:
                 all_ranges = []
                 if os.path.exists(INPUT_FILE):
@@ -990,6 +1013,17 @@ def main():
             ip_proxy_count = 0
 
             if current_phase == 'full':
+                # ★ 核心修复：如果该 IP 不在前置探活的存活名单里，直接秒过，不扣发包数
+                if full_alive_set is not None and ip not in full_alive_set:
+                    with found_lock:
+                        processed_ips[0] += 1
+                        real_done = start_position + processed_ips[0]
+                        pct = real_done * 100.0 / total_ips if total_ips else 0
+                        elapsed = time.time() - t0
+                        log('[full] IP %s 不在存活名单中(死IP复活失败)，直接跳过 | 本片 %d/%d (%.2f%%) | %.0f s'
+                            % (ip, real_done, total_ips, pct, elapsed))
+                    continue
+
                 ip_alive = False
                 probe_futures = [port_pool.submit(tcp_check, ip, port) for port in COMMON_PORTS]
                 for pf in as_completed(probe_futures):
