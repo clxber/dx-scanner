@@ -35,7 +35,8 @@
 ★ 神来一笔：full 开拔前置全量探活 —— 进入 full 阶段时一次性用 1000 并发把上游全部待深扫 IP 的
   188 个常用端口探一遍，几秒钟剔除死 IP，生成纯净的 full_alive_shardN.txt 存活名单，再用这份
   名单去跑 10 个一批的接力深扫，省下海量 GitHub Actions 接力轮次与运行额度。幂等：文件存在即复用。
-★ Bug 修复：状态文件写入 all_upstream_ips_len，供 merge_shards.py 精准判定 full 游标是否到达终点。
+★ 自动分片切分：当处于 full 阶段且 proxy_missing_shardN.txt 不存在时，自动读取全局 alive_ips.txt
+  并按 1/8 均分生成对应分片文件，省去手动切分文件的痛苦！
 """
 
 import os
@@ -507,7 +508,6 @@ def _skip_this_shard(state_file, output_filter_file, phase, ports_count):
     }
     save_json(state_file, state)
     
-    # ★ 核心修复：秒退时绝不清空草稿纸，防止把上个 session 找到的存活 IP 给扬了
     if output_filter_file:
         pass
 
@@ -645,6 +645,29 @@ def main():
 
     PORTS, upstream_file, output_filter_file = get_phase_config(current_phase)
 
+    # ============ ★ 自动分片切分 ============
+    if current_phase == 'full' and upstream_file is not None:
+        if not os.path.exists(upstream_file) and os.path.exists('alive_ips.txt'):
+            log('[full] 发现上游分片文件 %s 不存在，但检测到全局 alive_ips.txt，自动按分片切分...' % upstream_file)
+            global_alive = []
+            with open('alive_ips.txt', 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('@'):
+                        continue
+                    ip_str = line.split('|')[0].strip()
+                    global_alive.append(ip_str)
+            
+            if global_alive:
+                shard_size = (len(global_alive) + SHARD_TOTAL - 1) // SHARD_TOTAL
+                lo = SHARD_INDEX * shard_size
+                hi = min(lo + shard_size, len(global_alive))
+                my_ips = global_alive[lo:hi]
+                with open(upstream_file, 'w', encoding='utf-8', newline='') as f:
+                    for ip in my_ips:
+                        f.write(ip + CRLF)
+                log('[full] 自动切分完成！本片分得 %d 个 IP，已保存至 %s' % (len(my_ips), upstream_file))
+
     # ============ ★ 神来一笔：full 阶段开拔前置全量探活 ============
     if current_phase == 'full' and upstream_file is not None:
         if not os.path.exists(FULL_ALIVE_FILE):
@@ -681,7 +704,6 @@ def main():
                 log('[full] 上游名单为空，探活过滤直接跳过')
         
         upstream_file = FULL_ALIVE_FILE
-    # =============================================================
 
     ip_list = []
     current_offset = 0
@@ -691,7 +713,6 @@ def main():
     f_offset = 0
 
     if current_phase == 'common':
-        # ============ common 阶段：全量游标切片 ============
         all_ranges = load_ip_ranges(INPUT_FILE)
         if not all_ranges:
             log('未读取到有效 IP 范围')
@@ -722,7 +743,6 @@ def main():
         ip_list = batch_ips[lo:hi]
         
     else:
-        # ============ revalidate / proxy / full 阶段：直接读上游分片文件 ============
         if upstream_file is not None and os.path.exists(upstream_file):
             wanted = load_ip_set(upstream_file)
             if wanted:
@@ -746,7 +766,6 @@ def main():
                 all_upstream_ips_len = len(all_upstream_ips)
 
                 if current_phase == 'full':
-                    # ★ full 阶段也采用游标切片，每次只扫 FULL_BATCH_SIZE 个 IP
                     fc_state = load_json(FULL_CURSOR_FILE) or {'offset': 0}
                     f_offset = fc_state.get('offset', 0)
                     
@@ -783,7 +802,6 @@ def main():
 
     state = load_json(STATE_FILE)
     
-    # ★ 核心优化：如果当前分片在当前批次已经彻底跑完了，直接秒退，绝不白跑重扫
     if state and state.get('completed'):
         is_same_batch = (state.get('total_ips') == total_ips 
                          and state.get('phase') == current_phase)
@@ -805,11 +823,9 @@ def main():
     if (state and not state.get('completed')
             and state.get('total_ips') == total_ips
             and state.get('phase') == current_phase):
-        # 针对 full 阶段：必须游标 f_offset 也能对上，才是真正的同一批任务续跑
         if current_phase == 'full':
             if state.get('f_offset') == f_offset:
                 new_round = False
-        # 针对 common 阶段：必须全局游标 current_offset 也能对上，才是真正的同一批任务续跑
         elif current_phase == 'common':
             if state.get('c_offset') == current_offset:
                 new_round = False
@@ -838,7 +854,6 @@ def main():
             f.write('@' + '-' * 58 + CRLF)
         existing = set()
         
-        # ★ 优化日志文案：叫"批次扫描"
         if current_phase == 'common':
             log('=== 批次扫描 (全局游标 %d) [分片 %d/%d, phase=%s] ==='
                 % (current_offset, SHARD_INDEX, SHARD_TOTAL, current_phase))
@@ -887,7 +902,6 @@ def main():
         except Exception:
             pass
 
-    # ★ 视觉归零：如果在 common 阶段且是全新游标（0），历史累计清零
     if current_phase == 'common' and current_offset == 0:
         history_alive_count = 0
         global_proxy_count = 0
@@ -992,7 +1006,6 @@ def main():
                             % (ip, real_done, total_ips, pct, elapsed))
                     continue
 
-            # ★ 优化：针对 full 阶段，采用滑动窗口分批提交（5000），防止内存和 GIL 假死
             if current_phase == 'full':
                 chunk_size = 5000
                 for i in range(0, len(PORTS), chunk_size):
@@ -1040,12 +1053,10 @@ def main():
                             if port_tasks[0] >= SHARD_MAX_REQUESTS and not stop_flag[0]:
                                 log('[!] 单分片探活次数达到 %d，触发换 IP 熔断！' % SHARD_MAX_REQUESTS)
                                 stop_flag[0] = True
-                                # ★ 核心修复：不再强制 current_pos = total_ips，保留现场
                                 return
                     if stop_flag[0]: return
 
             else:
-                # common / revalidate / proxy 阶段，直接提交（端口少，不会堆积）
                 futures = []
                 for port in PORTS:
                     all_done = True
@@ -1091,7 +1102,6 @@ def main():
                         if port_tasks[0] >= SHARD_MAX_REQUESTS and not stop_flag[0]:
                             log('[!] 单分片探活次数达到 %d，触发换 IP 熔断！' % SHARD_MAX_REQUESTS)
                             stop_flag[0] = True
-                            # ★ 核心修复：不再强制 current_pos = total_ips，保留现场
                             return
                     if short_circuit and ip_has_open:
                         break
