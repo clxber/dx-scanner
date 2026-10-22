@@ -12,7 +12,7 @@
 
 验证：单验证 —— 读秀（https://www.duxiu.com/），命中「读秀学术搜索」才算有效代理
 代理协议：http / socks5 / socks4（已去掉 https）
-★ 终极定版：TCP_TIMEOUT=1.0，CONNECT_TIMEOUT=10，MAX_TIME=20 (防假死极速超时)
+★ 终极定版：TCP_TIMEOUT=1.0，CONNECT_TIMEOUT=5，MAX_TIME=8 (防假死极速超时)
 ★ 极限并发：80×25 = 2000 并发（实测 2500 task/s）
 ★ 彻底取消验证限速（VERIFY_RATE_LIMIT=0），且内嵌验证并发，解决串行卡 35 分钟的问题
 ★ full 前置探活：全端口前先探 COMMON_PORTS（188个），若全闭直接跳过，防止死 IP 浪费时间
@@ -40,6 +40,7 @@
 ★ 游标稳定性重构：游标底座永远锁定为 proxy_missing_shardN.txt，绝不因为探活结果变化而导致游标错位。
   前置探活结果 full_alive_shardN.txt 仅作为“通行证”，切出来的 IP 若在通行证外，直接秒跳，游标依然稳定推进。
   同时引入 load_ip_list 强制排序，彻底消除 set 无序导致的随机切片 Bug。
+★ 动态时间熔断：单 IP 扫描超过 1800 秒 (MAX_IP_TIME = 30 分钟) 且未发现任何代理，直接判定为高防假死IP，提前 break 放弃，防止单 IP 拖垮全片。
 """
 
 import os
@@ -67,8 +68,9 @@ FINISHED_FLAG = 'scan_finished.flag'
 
 # ============ 配置 ============
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-CONNECT_TIMEOUT = 10
-MAX_TIME = 20
+CONNECT_TIMEOUT = 5
+MAX_TIME = 8
+MAX_IP_TIME = 1800  # ★ 单 IP 最大耗时 1800 秒(30分钟)，超过直接放弃
 
 VERIFY_TARGETS = [
     {
@@ -1011,6 +1013,7 @@ def main():
             ip_has_proxy = False
             ip_open_count = 0
             ip_proxy_count = 0
+            ip_start_time = time.time()  # ★ 记录该 IP 开始时间
 
             if current_phase == 'full':
                 # ★ 核心修复：如果该 IP 不在前置探活的存活名单里，直接秒过，不扣发包数
@@ -1043,6 +1046,11 @@ def main():
             if current_phase == 'full':
                 chunk_size = 5000
                 for i in range(0, len(PORTS), chunk_size):
+                    # ★ 动态时间熔断：如果单 IP 耗时超过 1800 秒(30分钟)且没代理，直接放弃
+                    if time.time() - ip_start_time > MAX_IP_TIME and ip_proxy_count == 0:
+                        log('[full] IP %s 耗时超过 %d s 仍无代理，判定为高防/假死鸡，提前放弃剩余端口' % (ip, MAX_IP_TIME))
+                        break
+
                     chunk_ports = PORTS[i:i+chunk_size]
                     chunk_futures = []
                     for port in chunk_ports:
