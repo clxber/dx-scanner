@@ -47,6 +47,9 @@
   - port_pool：2000 并发，只跑 tcp_check，速度起飞。
   - verify_pool：日常 300 并发，防止 4 核机器被数千个 curl 进程撑爆内存假死。
   - Graceful Shutdown：主线程结束后，若剩余任务过多，立刻拉起 1000 并发临时池光速收尾，绝不漏数据。
+★ 千万级 IP 终极防 OOM 重构：
+  废弃了 expand_ranges_to_ips 的整段展开列表，改为【按需流式切片】（get_ips_slice）。
+  无论 ip_list.txt 有几千万个 IP，内存占用永远只有 BATCH_SIZE 那么大，彻底根绝 Runner 内存溢出。
 """
 
 import os
@@ -260,12 +263,35 @@ def load_ip_ranges(path):
     return ranges
 
 
-def expand_ranges_to_ips(ranges):
+# ★ 终极防 OOM 核心：流式按需切片
+def get_ips_slice(ranges, start_idx, end_idx):
+    """根据范围列表，只提取游标对应的这一小段 IP（不展开整个 6500 万列表）"""
     flat = []
+    current_idx = 0
     for s, e, note in ranges:
-        for ip_int in range(s, e + 1):
+        count = e - s + 1
+        # 如果当前范围在目标切片结束之后，直接跳出
+        if current_idx >= end_idx:
+            break
+        # 如果当前范围在目标切片开始之前，直接跳过
+        if current_idx + count <= start_idx:
+            current_idx += count
+            continue
+        
+        # 计算重叠部分
+        overlap_start = max(s, s + (start_idx - current_idx))
+        overlap_end = min(e, s + (end_idx - current_idx - 1))
+        
+        for ip_int in range(overlap_start, overlap_end + 1):
             flat.append((ip_int, note))
+            
+        current_idx += count
     return flat
+
+
+def get_total_ips_count(ranges):
+    """纯数学计算总 IP 数，不展开列表"""
+    return sum(e - s + 1 for s, e, n in ranges)
 
 
 def ip_int_to_str(ip_int):
@@ -750,8 +776,8 @@ def main():
             log('未读取到有效 IP 范围')
             sys.exit(1)
 
-        all_ips_flat = expand_ranges_to_ips(all_ranges)
-        total_all_ips = len(all_ips_flat)
+        # ★ 千万级防 OOM 流式切片
+        total_all_ips = get_total_ips_count(all_ranges)
         
         cursor_state = load_json(CURSOR_FILE) or {'offset': 0}
         current_offset = cursor_state.get('offset', 0)
@@ -765,7 +791,7 @@ def main():
             return
 
         batch_end = min(current_offset + BATCH_SIZE, total_all_ips)
-        batch_ips = all_ips_flat[current_offset:batch_end]
+        batch_ips = get_ips_slice(all_ranges, current_offset, batch_end)
         log('当前批次游标: %d ~ %d，本批次共 %d 个 IP' % (current_offset, batch_end, len(batch_ips)))
 
         total_in_batch = len(batch_ips)
