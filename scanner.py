@@ -51,10 +51,13 @@
   废弃了 expand_ranges_to_ips 的整段展开列表，改为【按需流式切片】（get_ips_slice）。
   无论 ip_list.txt 有几千万个 IP，内存占用永远只有 BATCH_SIZE 那么大，彻底根绝 Runner 内存溢出。
 ★ 3 协议并发与 proxy 阶段分流（防 OOM）：
-  scan_port_full 内部原本是 3 个协议串行（33 秒），现在改为开 3 个线程并发测 http/socks5/socks4。
-  耗时压缩到 11 秒，完美适配外层 13 秒超时，彻底解决“慢速 socks 代理被 outer timeout 截断漏掉”的问题。
-  ★ 同时为了防止 proxy 阶段在 2000 并发下把内存撑爆（6000 个 curl），proxy 阶段强制走串行（False），
-  full 阶段和收尾阶段保持并发（True），完美兼顾防漏和防炸。
+  scan_port_full 内部原本是 3 个协议串行（33 秒）。
+  现在：
+    - full 阶段和收尾阶段：开 3 个线程并发测 http/socks5/socks4，最坏 11 秒，
+      完美适配 full 阶段外层 13 秒超时，解决"慢速 socks 代理被 outer timeout 截断漏掉"的问题。
+    - proxy 阶段：保持 3 协议串行（concurrent=False），最坏 33 秒，外层超时放宽到 40 秒兜住。
+      原因：proxy 阶段走 2000 并发的 port_pool，若内部再并发会瞬间 6000 个 curl，直接 OOM。
+  这样完美兼顾防漏和防炸。
 ★ proxy 阶段超时放宽：
   因为 proxy 阶段走的是串行 3 协议（最坏 33 秒），如果外层还按 3 秒超时，会把第 2、3 个慢速协议掐死。
   所以 proxy 阶段的外层 fut.result 超时被放宽到 40 秒，配合 MAX_IP_TIME_COMMON=60 秒兜底，完美兜住所有慢速代理。
