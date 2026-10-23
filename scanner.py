@@ -13,7 +13,7 @@
 验证：单验证 —— 读秀（https://www.duxiu.com/），命中「读秀学术搜索」才算有效代理
 代理协议：http / socks5 / socks4（已去掉 https）
 ★ 终极定版：TCP_TIMEOUT=1.0，CONNECT_TIMEOUT=5，MAX_TIME=8 (防假死极速超时)
-★ 极限并发：80×25 = 2000 并发（实测 2500 task/s）
+★ 极限并发：TCP 80×25 = 2000 并发，curl 150 并发（彻底分离，防止 OOM）
 ★ 彻底取消验证限速（VERIFY_RATE_LIMIT=0），且内嵌验证并发，解决串行卡 35 分钟的问题
 ★ full 前置探活：全端口前先探 COMMON_PORTS（188个），若全闭直接跳过，防止死 IP 浪费时间
 ★ 全端口开拔前置过滤：进入 full 阶段时，一次性并发探活所有待深扫 IP，剔除死 IP 后再进行 10 个一批的接力
@@ -43,6 +43,9 @@
 ★ 双时间熔断：
   - common / revalidate / proxy 阶段：单 IP 超过 60 秒（MAX_IP_TIME_COMMON）直接熔断。
   - full 阶段：单 IP 超过 300 秒（MAX_IP_TIME_FULL）直接熔断。
+★ 彻底分离线程池（解决卡死和 OOM）：
+  - port_pool：2000 并发，只跑 tcp_check，速度起飞。
+  - verify_pool：150 并发，专门跑 curl 验证。限制并发防止 4 核机器被数千个 curl 进程撑爆内存。
 """
 
 import os
@@ -57,7 +60,7 @@ import argparse
 import subprocess
 import ipaddress
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 # ============ 核心调度参数（自动从环境变量读取，如果没有则用默认值） ============
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 30000))
@@ -144,6 +147,7 @@ VERIFY_RETRY = 0
 VERIFY_DELAY = 0.0
 TCP_WORKERS = 80
 PORT_WORKERS = 25
+VERIFY_WORKERS = 150   # ★ curl 验证专用线程池大小
 IP_COOLDOWN = 0.5
 VERIFY_RATE_LIMIT = 0
 
@@ -996,7 +1000,10 @@ def main():
             current_pos[0] += 1
             return p
 
+    # ★ 彻底分离线程池
     port_pool = ThreadPoolExecutor(max_workers=TCP_WORKERS * PORT_WORKERS)
+    verify_pool = ThreadPoolExecutor(max_workers=VERIFY_WORKERS)
+
     if current_phase in ('common', 'revalidate'):
         scan_fn = scan_port_common
         short_circuit = True
@@ -1064,34 +1071,51 @@ def main():
                                 break
                         if all_done:
                             continue
-                        chunk_futures.append((port, port_pool.submit(scan_fn, ip, port)))
+                        chunk_futures.append((port, port_pool.submit(tcp_check, ip, port)))
                     
                     for port, fut in chunk_futures:
                         if stop_flag[0]: return
                         try:
-                            is_open, r_list = fut.result()
+                            is_open = fut.result(timeout=TCP_TIMEOUT + 2)
+                        except TimeoutError:
+                            is_open = False
                         except Exception:
-                            is_open, r_list = False, []
+                            is_open = False
+                        
                         if is_open:
                             ip_has_open = True
                             ip_open_count += 1
-                        if r_list:
-                            ip_has_proxy = True
-                            for item in r_list:
-                                ip_, port_, proto_ = item
-                                key = '%s:%d:%s' % (ip_, port_, proto_)
-                                with found_lock:
-                                    if key in existing: continue
-                                    existing.add(key)
-                                    found_count[0] += 1
-                                    ip_proxy_count += 1
-                                    if note:
-                                        line_out = '%s:%d@%s@%s' % (ip_, port_, proto_, note)
-                                    else:
-                                        line_out = '%s:%d@%s' % (ip_, port_, proto_)
-                                    with open(OUTPUT_FILE, 'a', encoding='utf-8', newline='') as f:
-                                        f.write(line_out + CRLF)
-                                    log('[+] ' + line_out)
+                            # ★ 核心修复：发现开放端口后，丢给 verify_pool 去做 curl 验证
+                            v_fut = verify_pool.submit(scan_port_full, ip, port)
+                            # 这里为了不阻塞主循环，不立即等待结果，而是把结果收集逻辑放在后面。
+                            # 但为了当前代码结构的兼容性，我们用一个临时的子协程或者收集列表。
+                            # 稍后统一处理。
+                            # 为了简化，直接在这里通过 verify_pool 获取结果。因为 verify_pool 已经限制了并发，
+                            # 这里的 fut.result() 实际上是在等 verify_pool 的坑位，不会导致 port_pool 的 2000 个并发爆掉。
+                            try:
+                                _, r_list = v_fut.result(timeout=MAX_TIME + 5)
+                            except TimeoutError:
+                                r_list = []
+                            except Exception:
+                                r_list = []
+                            
+                            if r_list:
+                                ip_has_proxy = True
+                                for item in r_list:
+                                    ip_, port_, proto_ = item
+                                    key = '%s:%d:%s' % (ip_, port_, proto_)
+                                    with found_lock:
+                                        if key in existing: continue
+                                        existing.add(key)
+                                        found_count[0] += 1
+                                        ip_proxy_count += 1
+                                        if note:
+                                            line_out = '%s:%d@%s@%s' % (ip_, port_, proto_, note)
+                                        else:
+                                            line_out = '%s:%d@%s' % (ip_, port_, proto_)
+                                        with open(OUTPUT_FILE, 'a', encoding='utf-8', newline='') as f:
+                                            f.write(line_out + CRLF)
+                                        log('[+] ' + line_out)
                         with found_lock:
                             port_tasks[0] += 1
                             
@@ -1121,7 +1145,9 @@ def main():
                         log('[!] [%s] IP %s 耗时超过 %d s (1分钟) 仍无结果，强制熔断剩余端口！' % (current_phase, ip, MAX_IP_TIME_COMMON))
                         break
                     try:
-                        is_open, r_list = fut.result()
+                        is_open, r_list = fut.result(timeout=TCP_TIMEOUT + 2)
+                    except TimeoutError:
+                        is_open, r_list = False, []
                     except Exception:
                         is_open, r_list = False, []
                     if is_open:
@@ -1158,7 +1184,7 @@ def main():
             if current_phase == 'common' and ip_has_open:
                 verify_futures = []
                 for port in PROXY_PORTS:
-                    verify_futures.append(port_pool.submit(scan_port_full, ip, port))
+                    verify_futures.append(verify_pool.submit(scan_port_full, ip, port))
                 
                 for fut in as_completed(verify_futures):
                     if stop_flag[0]:
@@ -1168,7 +1194,9 @@ def main():
                         log('[!] [common] IP %s 耗时超过 %d s (1分钟) 仍无代理，强制熔断剩余验证！' % (ip, MAX_IP_TIME_COMMON))
                         break
                     try:
-                        _, r_list2 = fut.result()
+                        _, r_list2 = fut.result(timeout=MAX_TIME + 5)
+                    except TimeoutError:
+                        r_list2 = []
                     except Exception:
                         r_list2 = []
                     
@@ -1265,6 +1293,7 @@ def main():
     finally:
         stop_flag[0] = True
         port_pool.shutdown(wait=False)
+        verify_pool.shutdown(wait=False)
 
     with pos_lock:
         state['position'] = current_pos[0]
