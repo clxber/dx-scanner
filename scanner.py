@@ -13,7 +13,7 @@
 验证：单验证 —— 读秀（https://www.duxiu.com/），命中「读秀学术搜索」才算有效代理
 代理协议：http / socks5 / socks4（已去掉 https）
 ★ 终极定版：TCP_TIMEOUT=1.0，CONNECT_TIMEOUT=5，MAX_TIME=8 (防假死极速超时)
-★ 极限并发：TCP 80×25 = 2000 并发，日常 curl 300 并发（防 CPU 爆炸），收尾阶段动态扩至 1000 并发！
+★ 极限并发：TCP 80×25 = 2000 并发，日常 curl 150 并发（防 CPU 爆炸），收尾阶段动态扩至 400 并发！
 ★ 彻底取消验证限速（VERIFY_RATE_LIMIT=0），且内嵌验证并发，解决串行卡 35 分钟的问题
 ★ full 前置探活：全端口前先探 COMMON_PORTS（188个），若全闭直接跳过，防止死 IP 浪费时间
 ★ 全端口开拔前置过滤：进入 full 阶段时，一次性并发探活所有待深扫 IP，剔除死 IP 后再进行 10 个一批的接力
@@ -45,11 +45,19 @@
   - full 阶段：单 IP 超过 300 秒（MAX_IP_TIME_FULL）直接熔断。
 ★ 彻底分离线程池与动态扩容收尾：
   - port_pool：2000 并发，只跑 tcp_check，速度起飞。
-  - verify_pool：日常 300 并发，防止 4 核机器被数千个 curl 进程撑爆内存假死。
-  - Graceful Shutdown：主线程结束后，若剩余任务过多，立刻拉起 1000 并发临时池光速收尾，绝不漏数据。
+  - verify_pool：日常 150 并发（峰值 450 个 curl），防止 4 核机器被数千个 curl 进程撑爆内存假死。
+  - Graceful Shutdown：主线程结束后，若剩余任务过多，立刻拉起 400 并发临时池（峰值 1200 个 curl），光速收尾，绝不漏数据。
 ★ 千万级 IP 终极防 OOM 重构：
   废弃了 expand_ranges_to_ips 的整段展开列表，改为【按需流式切片】（get_ips_slice）。
   无论 ip_list.txt 有几千万个 IP，内存占用永远只有 BATCH_SIZE 那么大，彻底根绝 Runner 内存溢出。
+★ 3 协议并发与 proxy 阶段分流（防 OOM）：
+  scan_port_full 内部原本是 3 个协议串行（33 秒），现在改为开 3 个线程并发测 http/socks5/socks4。
+  耗时压缩到 11 秒，完美适配外层 13 秒超时，彻底解决“慢速 socks 代理被 outer timeout 截断漏掉”的问题。
+  ★ 同时为了防止 proxy 阶段在 2000 并发下把内存撑爆（6000 个 curl），proxy 阶段强制走串行（False），
+  full 阶段和收尾阶段保持并发（True），完美兼顾防漏和防炸。
+★ proxy 阶段超时放宽：
+  因为 proxy 阶段走的是串行 3 协议（最坏 33 秒），如果外层还按 3 秒超时，会把第 2、3 个慢速协议掐死。
+  所以 proxy 阶段的外层 fut.result 超时被放宽到 40 秒，配合 MAX_IP_TIME_COMMON=60 秒兜底，完美兜住所有慢速代理。
 """
 
 import os
@@ -151,7 +159,7 @@ VERIFY_RETRY = 0
 VERIFY_DELAY = 0.0
 TCP_WORKERS = 80
 PORT_WORKERS = 25
-VERIFY_WORKERS = 300   # ★ 日常 curl 验证池并发
+VERIFY_WORKERS = 150   # ★ 日常 curl 验证池并发（3 协议并发后，峰值 450 个 curl）
 IP_COOLDOWN = 0.5
 VERIFY_RATE_LIMIT = 0
 
@@ -528,14 +536,34 @@ def scan_port_common(ip, port):
     return tcp_check(ip, port), []
 
 
-def scan_port_full(ip, port):
+def scan_port_full(ip, port, concurrent=True):
     if not tcp_check(ip, port):
         return False, []
+    
     working = []
-    for proto in PROTOCOLS:
+    
+    def _test_proto(proto):
         ok, _ = verify_proxy(ip, port, proto)
         if ok:
-            working.append((ip, port, proto))
+            return (ip, port, proto)
+        return None
+        
+    if not concurrent:
+        # ★ proxy 阶段：串行 3 协议，最坏 33s，但不会堆积 3 倍 curl
+        for p in PROTOCOLS:
+            res = _test_proto(p)
+            if res:
+                working.append(res)
+        return True, working
+
+    # ★ full 阶段和收尾阶段：3 协议并发，避免单个慢协议拖垮整体
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futs = [pool.submit(_test_proto, p) for p in PROTOCOLS]
+        for f in as_completed(futs):
+            res = f.result()
+            if res:
+                working.append(res)
+                
     return True, working
 
 
@@ -1161,17 +1189,25 @@ def main():
                             break
                     if all_done:
                         continue
-                    futures.append((port, port_pool.submit(scan_fn, ip, port)))
+                    if current_phase == 'proxy':
+                        futures.append((port, port_pool.submit(scan_port_full, ip, port, False)))
+                    else:
+                        futures.append((port, port_pool.submit(scan_fn, ip, port)))
 
                 for port, fut in futures:
                     if stop_flag[0]:
                         return
-                    # ★ 动态时间熔断：common / revalidate / proxy 阶段使用 MAX_IP_TIME_COMMON
+                    # ★ 动态时间熔断：common / revalidate 使用短超时，proxy 使用 40 秒
+                    if current_phase == 'proxy':
+                        wait_timeout = 40
+                    else:
+                        wait_timeout = TCP_TIMEOUT + 2
+                        
                     if time.time() - ip_start_time > MAX_IP_TIME_COMMON:
                         log('[!] [%s] IP %s 耗时超过 %d s (1分钟) 仍无结果，强制熔断剩余端口！' % (current_phase, ip, MAX_IP_TIME_COMMON))
                         break
                     try:
-                        is_open, r_list = fut.result(timeout=TCP_TIMEOUT + 2)
+                        is_open, r_list = fut.result(timeout=wait_timeout)
                     except TimeoutError:
                         is_open, r_list = False, []
                     except Exception:
@@ -1288,14 +1324,14 @@ def main():
         stop_flag[0] = True
         port_pool.shutdown(wait=False)
         
-        # ★ 动态扩容收尾：主线程结束了，如果有遗留任务，拉起 1000 并发光速清理
+        # ★ 动态扩容收尾：主线程结束了，如果有遗留任务，拉起 400 并发光速清理（峰值 1200 个 curl）
         with pending_verify_lock:
             leftover_tasks = pending_verify_tasks[:]
             pending_verify_tasks.clear()
 
         if leftover_tasks:
-            log('[!] 正在启动 1000 并发光速收尾，共 %d 个代理验证任务...' % len(leftover_tasks))
-            final_pool = ThreadPoolExecutor(max_workers=1000)
+            log('[!] 正在启动 400 并发光速收尾，共 %d 个代理验证任务...' % len(leftover_tasks))
+            final_pool = ThreadPoolExecutor(max_workers=400)
             futs = []
             for ip, port in leftover_tasks:
                 futs.append(final_pool.submit(scan_port_full, ip, port))
