@@ -682,10 +682,10 @@ jobs:
           PROXY_THRESHOLD: ${{ github.event.inputs.proxy_threshold || '1' }}
         run: python merge_shards.py
 
-      - name: 提交合并（抗网络抖动强化版）
+      - name: 提交合并（极限抗断网版）
         if: always() && steps.check_cancel.outputs.is_cancelled == 'false'
         run: |
-          # 1. 给 Git 穿上防弹衣，防止大文件中断和长连接被掐
+          # 1. 给 Git 穿上防弹衣
           git config --global http.postBuffer 524288000
           git config --global http.lowSpeedLimit 1000
           git config --global http.lowSpeedTime 300
@@ -694,27 +694,29 @@ jobs:
           git diff --staged --quiet || git commit -m "合并 [skip ci]"
           git stash -u 2>/dev/null || true
           
-          # 2. 指数退避重试（总等待时间长达 63 分钟 + 6次超时）
+          # 2. 极限重试：12次，线性递增，单次封顶15分钟。总容错约 3.2 小时！
           success=false
-          for i in $(seq 1 6); do
+          for i in $(seq 1 12); do
             if git pull origin main --rebase && git push; then
               success=true; break
             fi
             git rebase --abort 2>/dev/null || true
-            WAIT=$((2 ** i * 30))  # 60s, 120s, 240s, 480s, 960s, 1920s
-            echo "⚠️ 网络波动，git 失败。重试 $i/6，等待 ${WAIT} 秒..."
+            WAIT=$((i * 300))
+            if [ $WAIT -gt 900 ]; then WAIT=900; fi
+            echo "⚠️ 网络波动，git 失败。重试 $i/12，等待 ${WAIT} 秒(约 $((WAIT/60)) 分钟)..."
             sleep $WAIT
           done
           [ "$success" = "true" ] || exit 1
 
-      - name: 触发下一轮（抗网络抖动强化版）
+      - name: 触发下一轮（极限抗断网版）
         if: always() && steps.check_cancel.outputs.is_cancelled == 'false'
         run: |
           FLAG="$RUNNER_TEMP/trigger.flag"
           if [ -f "$FLAG" ] && [ "$(cat "$FLAG")" = "yes" ]; then
             echo "🔄 准备触发下一轮 workflow..."
             success=false
-            for i in $(seq 1 5); do
+            # 重试 12 次，与 git 保持同等强度的抗断网能力
+            for i in $(seq 1 12); do
               if gh workflow run scan.yml --ref main \
                 -f batch_size="${{ github.event.inputs.batch_size || '30000' }}" \
                 -f full_batch_size="${{ github.event.inputs.full_batch_size || '10' }}" \
@@ -723,12 +725,13 @@ jobs:
                 success=true
                 break
               fi
-              WAIT=$((2 ** i * 20))
-              echo "⚠️ gh 命令超时（可能由于网络中断），重试 $i/5，等待 ${WAIT} 秒..."
+              WAIT=$((i * 300))
+              if [ $WAIT -gt 900 ]; then WAIT=900; fi
+              echo "⚠️ gh 命令超时，重试 $i/12，等待 ${WAIT} 秒(约 $((WAIT/60)) 分钟)..."
               sleep $WAIT
             done
             if [ "$success" = "false" ]; then
-              echo "❌ 5次重试全失败，网络极度不稳定，请手动触发下一轮。数据已安全保存！"
+              echo "❌ 12次重试全失败，网络极度不稳定，请手动触发下一轮。数据已安全保存！"
               exit 1
             fi
           else
