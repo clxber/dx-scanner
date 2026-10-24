@@ -61,6 +61,8 @@
 ★ proxy 阶段超时放宽：
   因为 proxy 阶段走的是串行 3 协议（最坏 33 秒），如果外层还按 3 秒超时，会把第 2、3 个慢速协议掐死。
   所以 proxy 阶段的外层 fut.result 超时被放宽到 40 秒，配合 MAX_IP_TIME_COMMON=60 秒兜底，完美兜住所有慢速代理。
+★ 备注丢失修复：
+  common 阶段收尾池的 pending_verify_tasks 修复了没有保存 note（归属地）的问题。
 """
 
 import os
@@ -1250,7 +1252,7 @@ def main():
                 # ★ 彻底异步化：只收集任务，不等待结果
                 with pending_verify_lock:
                     for port in PROXY_PORTS:
-                        pending_verify_tasks.append((ip, port))
+                        pending_verify_tasks.append((ip, port, note))  # ★ 修复：带上 note
 
             if current_phase == 'common':
                 if ip_has_open:
@@ -1336,7 +1338,7 @@ def main():
             log('[!] 正在启动 400 并发光速收尾，共 %d 个代理验证任务...' % len(leftover_tasks))
             final_pool = ThreadPoolExecutor(max_workers=400)
             futs = []
-            for ip, port in leftover_tasks:
+            for ip, port, note in leftover_tasks:
                 futs.append(final_pool.submit(scan_port_full, ip, port))
             
             for fut in as_completed(futs):
@@ -1354,7 +1356,10 @@ def main():
                                 continue
                             existing.add(key)
                             found_count[0] += 1
-                            line_out = '%s:%d@%s' % (ip_, port_, proto_)
+                            if note:
+                                line_out = '%s:%d@%s@%s' % (ip_, port_, proto_, note)
+                            else:
+                                line_out = '%s:%d@%s' % (ip_, port_, proto_)
                             with open(OUTPUT_FILE, 'a', encoding='utf-8', newline='') as f:
                                 f.write(line_out + CRLF)
                             log('[★] [common] 发现有效代理(收尾): ' + line_out)
