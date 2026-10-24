@@ -18,7 +18,7 @@ on:
       proxy_threshold:
         description: '节约原则阈值：proxy阶段找到多少个代理就跳过full'
         required: false
-        default: '5'
+        default: '1'
 
 permissions:
   contents: write
@@ -613,6 +613,7 @@ jobs:
           rm -f proxy_missing_shard*.txt
           rm -f working_proxies_shard*.txt
           rm -f full_cursor_shard*.json
+          rm -f full_alive_shard*.txt
           rm -f phase.json
           rm -f alive_ips.txt
           rm -f scan_finished.flag
@@ -681,31 +682,55 @@ jobs:
           PROXY_THRESHOLD: ${{ github.event.inputs.proxy_threshold || '1' }}
         run: python merge_shards.py
 
-      - name: 提交合并
+      - name: 提交合并（抗网络抖动强化版）
         if: always() && steps.check_cancel.outputs.is_cancelled == 'false'
         run: |
+          # 1. 给 Git 穿上防弹衣，防止大文件中断和长连接被掐
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 300
+          
           git add -A
           git diff --staged --quiet || git commit -m "合并 [skip ci]"
           git stash -u 2>/dev/null || true
+          
+          # 2. 指数退避重试（总等待时间长达 15 分钟）
           success=false
-          for i in $(seq 1 10); do
-            if git pull origin main --rebase && git push; then success=true; break; fi
+          for i in $(seq 1 6); do
+            if git pull origin main --rebase && git push; then
+              success=true; break
+            fi
             git rebase --abort 2>/dev/null || true
-            sleep $((RANDOM % 26 + 5))
+            WAIT=$((2 ** i * 15))  # 30s, 60s, 120s, 240s, 480s, 960s
+            echo "⚠️ 网络波动，git 失败。重试 $i/6，等待 ${WAIT} 秒..."
+            sleep $WAIT
           done
           [ "$success" = "true" ] || exit 1
 
-      - name: 触发下一轮
+      - name: 触发下一轮（抗网络抖动强化版）
         if: always() && steps.check_cancel.outputs.is_cancelled == 'false'
         run: |
           FLAG="$RUNNER_TEMP/trigger.flag"
           if [ -f "$FLAG" ] && [ "$(cat "$FLAG")" = "yes" ]; then
-            echo "🔄 触发下一轮 workflow"
-            gh workflow run scan.yml --ref main \
-              -f batch_size="${{ github.event.inputs.batch_size || '30000' }}" \
-              -f full_batch_size="${{ github.event.inputs.full_batch_size || '10' }}" \
-              -f total_max_requests="${{ github.event.inputs.total_max_requests || '5500000' }}" \
-              -f proxy_threshold="${{ github.event.inputs.proxy_threshold || '1' }}"
+            echo "🔄 准备触发下一轮 workflow..."
+            success=false
+            for i in $(seq 1 5); do
+              if gh workflow run scan.yml --ref main \
+                -f batch_size="${{ github.event.inputs.batch_size || '30000' }}" \
+                -f full_batch_size="${{ github.event.inputs.full_batch_size || '10' }}" \
+                -f total_max_requests="${{ github.event.inputs.total_max_requests || '5500000' }}" \
+                -f proxy_threshold="${{ github.event.inputs.proxy_threshold || '1' }}"; then
+                success=true
+                break
+              fi
+              WAIT=$((2 ** i * 10))
+              echo "⚠️ gh 命令超时（可能由于网络中断），重试 $i/5，等待 ${WAIT} 秒..."
+              sleep $WAIT
+            done
+            if [ "$success" = "false" ]; then
+              echo "❌ 5次重试全失败，网络极度不稳定，请手动触发下一轮。数据已安全保存！"
+              exit 1
+            fi
           else
             echo "✅ 结束，等待手动触发"
           fi
