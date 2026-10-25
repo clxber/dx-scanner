@@ -61,8 +61,12 @@
 ★ proxy 阶段超时放宽：
   因为 proxy 阶段走的是串行 3 协议（最坏 33 秒），如果外层还按 3 秒超时，会把第 2、3 个慢速协议掐死。
   所以 proxy 阶段的外层 fut.result 超时被放宽到 40 秒，配合 MAX_IP_TIME_COMMON=60 秒兜底，完美兜住所有慢速代理。
-★ 备注丢失修复：
+★ 备注丢失与错乱修复：
   common 阶段收尾池的 pending_verify_tasks 修复了没有保存 note（归属地）的问题。
+  同时修复了在收尾阶段由于变量作用域问题，导致所有代理共用最后一个 IP 学校名的隐藏 Bug。
+★ 进度日志优化：
+  把 common 阶段的进度日志里的"代理IP"去掉了（因为收尾前必为0），换成展示"待验证任务"。
+  同时为收尾阶段增加了每处理 5000 个任务的进度日志。
 """
 
 import os
@@ -1289,12 +1293,18 @@ def main():
                     speed = port_tasks[0] / elapsed if elapsed > 0 else 0
                     with open_ips_lock:
                         oc = len(open_ips)
-                        pc = len(proxy_ips)
                         rc = len(revalidated_ips)
                         pf = len(proxy_found_ips)
                         pm = len(proxy_missing_ips)
                     if current_phase == 'common':
-                        extra = '存活 %d (累计 %d) | 代理IP %d (累计 %d)' % (oc, history_alive_count + oc, pc, global_proxy_count + found_count[0] - len(existing) + pc)
+                        with pending_verify_lock:
+                            pending_count = len(pending_verify_tasks)
+                        extra = '存活 %d (累计 %d) | 历史代理 %d | 待验证任务 %d' % (
+                            oc, 
+                            history_alive_count + oc, 
+                            global_proxy_count, 
+                            pending_count
+                        )
                     elif current_phase == 'revalidate':
                         extra = '重验存活 %d' % rc
                     elif current_phase == 'proxy':
@@ -1338,10 +1348,19 @@ def main():
             log('[!] 正在启动 400 并发光速收尾，共 %d 个代理验证任务...' % len(leftover_tasks))
             final_pool = ThreadPoolExecutor(max_workers=400)
             futs = []
+            task_map = {}  # ★ 修复：建立 Future 与 (ip, port, note) 的映射，防止 note 变量泄漏
             for ip, port, note in leftover_tasks:
-                futs.append(final_pool.submit(scan_port_full, ip, port))
+                fut = final_pool.submit(scan_port_full, ip, port)
+                task_map[fut] = (ip, port, note)
+                futs.append(fut)
             
+            total_final_tasks = len(futs)
+            done_final_tasks = 0
+
             for fut in as_completed(futs):
+                done_final_tasks += 1
+                ip_, port_, note_ = task_map[fut]  # 精准获取该任务对应的学校名
+                
                 try:
                     _, r_list2 = fut.result(timeout=MAX_TIME + 5)
                 except (TimeoutError, Exception):
@@ -1349,20 +1368,27 @@ def main():
 
                 if r_list2:
                     for item in r_list2:
-                        ip_, port_, proto_ = item
-                        key = '%s:%d:%s' % (ip_, port_, proto_)
+                        ip_found, port_found, proto_found = item
+                        key = '%s:%d:%s' % (ip_found, port_found, proto_found)
                         with found_lock:
                             if key in existing:
                                 continue
                             existing.add(key)
                             found_count[0] += 1
-                            if note:
-                                line_out = '%s:%d@%s@%s' % (ip_, port_, proto_, note)
+                            if note_:
+                                line_out = '%s:%d@%s@%s' % (ip_found, port_found, proto_found, note_)
                             else:
-                                line_out = '%s:%d@%s' % (ip_, port_, proto_)
+                                line_out = '%s:%d@%s' % (ip_found, port_found, proto_found)
                             with open(OUTPUT_FILE, 'a', encoding='utf-8', newline='') as f:
                                 f.write(line_out + CRLF)
                             log('[★] [common] 发现有效代理(收尾): ' + line_out)
+                
+                # ★ 修复：增加收尾进度打印，每 5000 个任务打印一次
+                if done_final_tasks % 5000 == 0 or done_final_tasks == total_final_tasks:
+                    log('[收尾进度] 已处理 %d/%d 个验证任务 | 全局累积代理: %d 个' % (
+                        done_final_tasks, total_final_tasks, found_count[0]
+                    ))
+            
             final_pool.shutdown(wait=False)
 
     with pos_lock:
