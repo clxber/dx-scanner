@@ -1,13 +1,14 @@
 {
-  "position": 3750,
-  "done": 676721,
-  "total_ips": 3750,
+  "position": 0,
+  "done": 0,
+  "total_ips": 0,
+  "total_tasks": 0,
+  "ports_count": 189,
   "phase": "common",
   "shard_index": 0,
   "shard_total": 8,
-  "started_at": "2026-10-27 17:05:43",
+  "started_at": "2026-10-27 17:14:09",
   "completed": true,
-  "session": 1,
-  "c_offset": 19170000,
-  "completed_at": "2026-10-27 17:12:43"
+  "completed_at": "2026-10-27 17:14:09",
+  "session": 1
 }
