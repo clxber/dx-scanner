@@ -40,9 +40,10 @@
 ★ 游标稳定性重构：游标底座永远锁定为 proxy_missing_shardN.txt，绝不因为探活结果变化而导致游标错位。
   前置探活结果 full_alive_shardN.txt 仅作为“通行证”，切出来的 IP 若在通行证外，直接秒跳，游标依然稳定推进。
   同时引入 load_ip_list 强制排序，彻底消除 set 无序导致的随机切片 Bug。
-★ 双时间熔断：
-  - common / revalidate / proxy 阶段：单 IP 超过 30 秒（MAX_IP_TIME_COMMON）直接熔断。
-  - full 阶段：单 IP 超过 300 秒（MAX_IP_TIME_FULL）直接熔断。
+★ 多级时间熔断（防冲突）：
+  - common / revalidate 阶段：只跑 tcp_check，单 IP 超 30 秒直接熔断。
+  - proxy 阶段：串行 3 协议，每个端口 40 秒超时。单 IP 总耗时超 60 秒熔断。
+  - full 阶段：单 IP 超 300 秒直接熔断。
 ★ 彻底分离线程池与动态扩容收尾：
   - port_pool：2000 并发，只跑 tcp_check，速度起飞。
   - verify_pool：日常 150 并发（峰值 450 个 curl），防止 4 核机器被数千个 curl 进程撑爆内存假死。
@@ -58,9 +59,6 @@
     - proxy 阶段：保持 3 协议串行（concurrent=False），最坏 33 秒，外层超时放宽到 40 秒兜住。
       原因：proxy 阶段走 2000 并发的 port_pool，若内部再并发会瞬间 6000 个 curl，直接 OOM。
   这样完美兼顾防漏和防炸。
-★ proxy 阶段超时放宽：
-  因为 proxy 阶段走的是串行 3 协议（最坏 33 秒），如果外层还按 3 秒超时，会把第 2、3 个慢速协议掐死。
-  所以 proxy 阶段的外层 fut.result 超时被放宽到 40 秒，配合 MAX_IP_TIME_COMMON=30 秒兜底，完美兜住所有慢速代理。
 ★ 备注丢失与错乱修复：
   common 阶段收尾池的 pending_verify_tasks 修复了没有保存 note（归属地）的问题。
   同时修复了在收尾阶段由于变量作用域问题，导致所有代理共用最后一个 IP 学校名的隐藏 Bug。
@@ -96,8 +94,11 @@ FINISHED_FLAG = 'scan_finished.flag'
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 CONNECT_TIMEOUT = 5
 MAX_TIME = 8
-MAX_IP_TIME_COMMON = 30   # ★ common / revalidate / proxy 阶段：单 IP 最大耗时 30 秒
-MAX_IP_TIME_FULL = 300    # ★ full 阶段：单 IP 最大耗时 300 秒(5分钟)
+
+# ★ 多级单 IP 时间熔断，防止因协议差异导致误杀
+MAX_IP_TIME_COMMON = 30   # common / revalidate 阶段：单 IP 最大耗时 30 秒（只跑 tcp_check）
+MAX_IP_TIME_PROXY = 60    # proxy 阶段：单 IP 最大耗时 60 秒（每个端口 40 秒超时兜底）
+MAX_IP_TIME_FULL = 300    # full 阶段：单 IP 最大耗时 300 秒 (5分钟)
 
 VERIFY_TARGETS = [
     {
@@ -1206,14 +1207,16 @@ def main():
                 for port, fut in futures:
                     if stop_flag[0]:
                         return
-                    # ★ 动态时间熔断：common / revalidate 使用短超时，proxy 使用 40 秒
+                    # ★ 多级时间熔断：根据当前阶段动态判断
                     if current_phase == 'proxy':
                         wait_timeout = 40
+                        max_ip_time = MAX_IP_TIME_PROXY
                     else:
                         wait_timeout = TCP_TIMEOUT + 2
+                        max_ip_time = MAX_IP_TIME_COMMON
                         
-                    if time.time() - ip_start_time > MAX_IP_TIME_COMMON:
-                        log('[!] [%s] IP %s 耗时超过 %d s (30秒) 仍无结果，强制熔断剩余端口！' % (current_phase, ip, MAX_IP_TIME_COMMON))
+                    if time.time() - ip_start_time > max_ip_time:
+                        log('[!] [%s] IP %s 耗时超过 %d s 仍无结果，强制熔断剩余端口！' % (current_phase, ip, max_ip_time))
                         break
                     try:
                         is_open, r_list = fut.result(timeout=wait_timeout)
