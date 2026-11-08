@@ -1,7 +1,7 @@
 {
-  "current": "full",
-  "common_completed": true,
-  "revalidate_completed": true,
-  "proxy_completed": true,
+  "current": "verify_existing",
+  "common_completed": false,
+  "revalidate_completed": false,
+  "proxy_completed": false,
   "full_completed": false
 }
