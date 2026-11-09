@@ -43,7 +43,8 @@
 ★ 多级时间熔断（防冲突 + 防卡死）：
   - common / revalidate 阶段：只跑 tcp_check，单 IP 超 30 秒直接熔断。
   - proxy 阶段：串行 3 协议，每个端口 40 秒超时。单 IP 总耗时超 60 秒熔断。
-  - full 阶段：单 IP 超 300 秒直接熔断（取消“已有代理则不熔断”的免死金牌）。
+  - full 阶段：单 IP 超 300 秒直接熔断。
+  - full 阶段批次熔断：如果当前 10 个 IP 的批次里，有 8 个都吃满 300 秒熔断，直接终止本批次。
 ★ 彻底分离线程池与动态扩容收尾：
   - port_pool：2000 并发，只跑 tcp_check，速度起飞。
   - verify_pool：日常 150 并发（峰值 450 个 curl），防止 4 核机器被数千个 curl 进程撑爆内存假死。
@@ -59,6 +60,9 @@
     - proxy 阶段：保持 3 协议串行（concurrent=False），最坏 33 秒，外层超时放宽到 40 秒兜住。
       原因：proxy 阶段走 2000 并发的 port_pool，若内部再并发会瞬间 6000 个 curl，直接 OOM。
   这样完美兼顾防漏和防炸。
+★ 蜜罐秒踢与双重时间熔断修复：
+  - 单 IP 探活发现开放端口超过 1000 个，直接判定为防火墙/蜜罐，秒踢，不进行任何验证。
+  - 在验证死等循环内部加入时间检查，彻底杜绝“开放端口过多导致内层死等绕过 300 秒熔断”的 Bug。
 ★ 备注丢失与错乱修复：
   common 阶段收尾池的 pending_verify_tasks 修复了没有保存 note（归属地）的问题。
   同时修复了在收尾阶段由于变量作用域问题，导致所有代理共用最后一个 IP 学校名的隐藏 Bug。
@@ -99,6 +103,7 @@ MAX_TIME = 8
 MAX_IP_TIME_COMMON = 30   # common / revalidate 阶段：单 IP 最大耗时 30 秒（只跑 tcp_check）
 MAX_IP_TIME_PROXY = 60    # proxy 阶段：单 IP 最大耗时 60 秒（每个端口 40 秒超时兜底）
 MAX_IP_TIME_FULL = 300    # full 阶段：单 IP 最大耗时 300 秒 (5分钟)
+MAX_OPEN_PORTS_FULL = 1000 # full 阶段：单 IP 开放端口超过 1000 个，直接判定蜜罐秒踢
 
 VERIFY_TARGETS = [
     {
@@ -1058,6 +1063,9 @@ def main():
     proxy_found_ips = set()
     proxy_missing_ips = set()
 
+    # ★ 记录当前批次有多少个 IP 触发了 300 秒熔断
+    batch_full_timeout_count = [0]
+
     def next_position():
         with pos_lock:
             if current_pos[0] >= total_ips:
@@ -1125,10 +1133,16 @@ def main():
 
             if current_phase == 'full':
                 chunk_size = 5000
+                v_futures = []  # ★ 核心修复：收集验证任务，并发跑，最后统一收网
                 for i in range(0, len(PORTS), chunk_size):
                     # ★ 动态时间熔断：如果单 IP 耗时超过 300 秒(5分钟)，不管有没有代理，直接放弃
                     if time.time() - ip_start_time > MAX_IP_TIME_FULL:
                         log('[!] [full] IP %s 耗时超过 %d s (5分钟)，强制熔断放弃剩余端口！' % (ip, MAX_IP_TIME_FULL))
+                        with found_lock:
+                            batch_full_timeout_count[0] += 1
+                            if batch_full_timeout_count[0] >= 8:
+                                log('[!] [full] 当前批次已有 %d 个 IP 触发 300 秒熔断，可能遇到黑洞区，强制终止本批次！' % batch_full_timeout_count[0])
+                                stop_flag[0] = True
                         break
 
                     chunk_ports = PORTS[i:i+chunk_size]
@@ -1145,6 +1159,17 @@ def main():
                     
                     for port, fut in chunk_futures:
                         if stop_flag[0]: return
+                        
+                        # ★ 修复漏洞：在端口级别的循环里也要检查时间，防止被开放的端口太多卡死
+                        if time.time() - ip_start_time > MAX_IP_TIME_FULL:
+                            log('[!] [full] IP %s 耗时超过 %d s (5分钟)，强制熔断放弃剩余端口！' % (ip, MAX_IP_TIME_FULL))
+                            with found_lock:
+                                batch_full_timeout_count[0] += 1
+                                if batch_full_timeout_count[0] >= 8:
+                                    log('[!] [full] 当前批次已有 %d 个 IP 触发 300 秒熔断，可能遇到黑洞区，强制终止本批次！' % batch_full_timeout_count[0])
+                                    stop_flag[0] = True
+                            break
+                            
                         try:
                             is_open = fut.result(timeout=TCP_TIMEOUT + 2)
                         except TimeoutError:
@@ -1155,32 +1180,18 @@ def main():
                         if is_open:
                             ip_has_open = True
                             ip_open_count += 1
-                            # 提交给 verify_pool 验证
-                            v_fut = verify_pool.submit(scan_port_full, ip, port)
-                            try:
-                                _, r_list = v_fut.result(timeout=MAX_TIME + 5)
-                            except TimeoutError:
-                                r_list = []
-                            except Exception:
-                                r_list = []
                             
-                            if r_list:
-                                ip_has_proxy = True
-                                for item in r_list:
-                                    ip_, port_, proto_ = item
-                                    key = '%s:%d:%s' % (ip_, port_, proto_)
-                                    with found_lock:
-                                        if key in existing: continue
-                                        existing.add(key)
-                                        found_count[0] += 1
-                                        ip_proxy_count += 1
-                                        if note:
-                                            line_out = '%s:%d@%s@%s' % (ip_, port_, proto_, note)
-                                        else:
-                                            line_out = '%s:%d@%s' % (ip_, port_, proto_)
-                                        with open(OUTPUT_FILE, 'a', encoding='utf-8', newline='') as f:
-                                            f.write(line_out + CRLF)
-                                        log('[+] ' + line_out)
+                            # ★ 蜜罐秒踢：如果单 IP 开放端口超过 1000 个，直接放弃
+                            if ip_open_count > MAX_OPEN_PORTS_FULL:
+                                log('[!] [full] IP %s 开放端口超过 %d 个，判定为防火墙/蜜罐，强制放弃！' % (ip, MAX_OPEN_PORTS_FULL))
+                                with found_lock:
+                                    batch_full_timeout_count[0] += 1
+                                break
+                                
+                            # 提交给 verify_pool 验证，不在这里死等
+                            v_fut = verify_pool.submit(scan_port_full, ip, port)
+                            v_futures.append((port, v_fut))
+                            
                         with found_lock:
                             port_tasks[0] += 1
                             
@@ -1189,6 +1200,41 @@ def main():
                                 stop_flag[0] = True
                                 return
                     if stop_flag[0]: return
+
+                # ★ 端口探测完毕，统一收网验证结果
+                for port, v_fut in v_futures:
+                    if stop_flag[0]: return
+                    # 收网时也要防卡死
+                    if time.time() - ip_start_time > MAX_IP_TIME_FULL:
+                        log('[!] [full] IP %s 耗时超过 %d s (5分钟)，强制终止验证！' % (ip, MAX_IP_TIME_FULL))
+                        with found_lock:
+                            batch_full_timeout_count[0] += 1
+                        break
+                        
+                    try:
+                        _, r_list = v_fut.result(timeout=MAX_TIME + 5)
+                    except TimeoutError:
+                        r_list = []
+                    except Exception:
+                        r_list = []
+                    
+                    if r_list:
+                        ip_has_proxy = True
+                        for item in r_list:
+                            ip_, port_, proto_ = item
+                            key = '%s:%d:%s' % (ip_, port_, proto_)
+                            with found_lock:
+                                if key in existing: continue
+                                existing.add(key)
+                                found_count[0] += 1
+                                ip_proxy_count += 1
+                                if note:
+                                    line_out = '%s:%d@%s@%s' % (ip_, port_, proto_, note)
+                                else:
+                                    line_out = '%s:%d@%s' % (ip_, port_, proto_)
+                                with open(OUTPUT_FILE, 'a', encoding='utf-8', newline='') as f:
+                                    f.write(line_out + CRLF)
+                                log('[+] ' + line_out)
 
             else:
                 futures = []
