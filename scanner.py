@@ -3,11 +3,11 @@
 高校代理扫描器 —— 五阶段 + 分片 + 断点续跑
 
 阶段 1 verify_existing：验证已有代理（只有分片 0 干活）
-阶段 2 common         ：12 探针 + 188 代理（TCP 探活，IP 级短路）+ 顺便代理验证
+阶段 2 common         ：12 探针 + 191 代理（TCP 探活，IP 级短路）+ 顺便代理验证
                         → 输出 open_ips_shardN.txt（所有存活 IP）
                         → 输出 proxy_ips_shardN.txt（有代理的 IP，供 revalidate 用）
 阶段 3 revalidate     ：对 proxy_ips_shardN.txt（有代理的 IP）二次探活
-阶段 4 proxy          ：188 代理端口（完整扫描 + 单验证，3 协议全试）
+阶段 4 proxy          ：191 代理端口（完整扫描 + 单验证，3 协议全试）
 阶段 5 full           ：65535 全端口（只扫 proxy 未找到代理的 IP）
 
 验证：单验证 —— 读秀（https://www.duxiu.com/），命中「读秀学术搜索」才算有效代理
@@ -15,7 +15,7 @@
 ★ 终极定版：TCP_TIMEOUT=1.0，CONNECT_TIMEOUT=5，MAX_TIME=8 (防假死极速超时)
 ★ 极限并发：TCP 80×25 = 2000 并发，日常 curl 150 并发（防 CPU 爆炸），收尾阶段动态扩至 400 并发！
 ★ 彻底取消验证限速（VERIFY_RATE_LIMIT=0），且内嵌验证并发，解决串行卡 35 分钟的问题
-★ full 前置探活：全端口前先探 COMMON_PORTS（192个），若全闭直接跳过，防止死 IP 浪费时间
+★ full 前置探活：全端口前先探 COMMON_PORTS（195个），若全闭直接跳过，防止死 IP 浪费时间
 ★ 全端口开拔前置过滤：进入 full 阶段时，一次性并发探活所有待深扫 IP，剔除死 IP 后再进行 10 个一批的接力
 ★ 游标切片：按 BATCH_SIZE 切片，无缝换 IP 防止被防火墙封禁
 ★ full 游标切片：按 FULL_BATCH_SIZE=10 切片，单次扫 65 万次，彻底杜绝熔断误伤
@@ -31,9 +31,9 @@
 ★ 文案优化：将新切片日志精准区分为"批次扫描"，消除进度清零的误解
 ★ 视觉归零：当全局游标为 0 时，日志展示的历史累积 IP 强制归零，契合"重头开始"的直觉
 ★ 性能重构：full 阶段采用滑动窗口分批提交（每次 5000 个端口），既压满 2000 并发，又防止内存/GIL假死
-★ 战利品入库：将中科大实测有效端口 3123 及清华实测 4780, 59532, 11888, 12001 加入常用代理端口池
+★ 战利品入库：将中科大实测有效端口 3123 及清华实测 4780, 59532, 11888, 12001, 33811, 50179, 12000 加入常用代理端口池
 ★ 神来一笔：full 开拔前置全量探活 —— 进入 full 阶段时一次性用 1000 并发把上游全部待深扫 IP 的
-  192 个常用端口探一遍，几秒钟剔除死 IP，生成纯净的 full_alive_shardN.txt 存活名单，再用这份
+  195 个常用端口探一遍，几秒钟剔除死 IP，生成纯净的 full_alive_shardN.txt 存活名单，再用这份
   名单去跑 10 个一批的接力深扫，省下海量 GitHub Actions 接力轮次与运行额度。幂等：文件存在即复用。
 ★ 自动分片切分：当处于 full 阶段且 proxy_missing_shardN.txt 不存在时，自动读取全局 alive_ips.txt
   并按 1/8 均分生成对应分片文件，省去手动切分文件的痛苦，也省去了为了触发代码自动切分而重置游标重跑 common 阶段的麻烦！
@@ -133,6 +133,7 @@ def _build_proxy_ports():
         (8902, 8902), (18080, 18080), (17897, 17897),
         (3123, 3123), (4780, 4780), 
         (59532, 59532), (11888, 11888), (12001, 12001),
+        (33811, 33811), (50179, 50179), (12000, 12000),
     ]
     s = set()
     for a, b in groups:
@@ -772,7 +773,7 @@ def main():
     full_alive_set = None
     if current_phase == 'full' and upstream_file is not None:
         if not os.path.exists(FULL_ALIVE_FILE):
-            log('[full] 发现未过滤的深扫名单，开始启动 192 端口全量前置探活...')
+            log('[full] 发现未过滤的深扫名单，开始启动 195 端口全量前置探活...')
             wanted_for_probe = load_ip_list(upstream_file)
             if wanted_for_probe:
                 def check_ip_alive(w_ip):
@@ -1127,7 +1128,7 @@ def main():
                         real_done = start_position + processed_ips[0]
                         pct = real_done * 100.0 / total_ips if total_ips else 0
                         elapsed = time.time() - t0
-                        log('[full] IP %s 探活失败 (192端口全闭)，跳过全端口 | 本片 %d/%d (%.2f%%) | %.0f s'
+                        log('[full] IP %s 探活失败 (195端口全闭)，跳过全端口 | 本片 %d/%d (%.2f%%) | %.0f s'
                             % (ip, real_done, total_ips, pct, elapsed))
                     continue
 
