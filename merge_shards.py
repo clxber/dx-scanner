@@ -16,6 +16,9 @@
   - ★ 游标封顶：推进游标时，绝不超越实际总 IP 数（如 65536），防止出现 90000 这种虚高数字
   - ★ Bug 修复：scan_finished.flag 判定加入阈值对比，未达 PROXY_THRESHOLD 时即使有代理也切 full 兜底。
   - ★ 黑名单合并：将各个分片的 local 黑名单（blacklist_shardN.txt）合并去重到全局黑名单（blacklist_ips.txt）中。
+  - ★ 黑名单注释污染修复（核心）：读取旧全局黑名单和分片黑名单时，跳过以 @ 或 # 开头的注释行，
+    防止「@ 生成时间」「@ 总数」等注释被当成 IP 反复读入 blacklist_set 并重新写回，
+    导致 blacklist_ips.txt 急剧膨胀且包含无效数据。与 scanner.py 的 load_ip_set 修复保持同步。
 """
 
 import os
@@ -301,22 +304,22 @@ def build_alive_ip_ranges(ignore_old=False):
 def build_global_blacklist():
     blacklist_set = set()
     
-    # 先读取旧的全局黑名单
+    # 先读取旧的全局黑名单（★ 核心修复：跳过以 @ 或 # 开头的注释行）
     if os.path.exists(GLOBAL_BLACKLIST_FILE):
         with open(GLOBAL_BLACKLIST_FILE, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
                 line = line.strip()
-                if line:
+                if line and not line.startswith('@') and not line.startswith('#'):
                     blacklist_set.add(line)
 
-    # 再合并各个分片的局部黑名单
+    # 再合并各个分片的局部黑名单（同样跳过注释行）
     for i in range(SHARD_TOTAL):
         path = 'blacklist_shard%d.txt' % i
         if os.path.exists(path):
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 for line in f:
                     line = line.strip()
-                    if line:
+                    if line and not line.startswith('@') and not line.startswith('#'):
                         blacklist_set.add(line)
 
     with open(GLOBAL_BLACKLIST_FILE, 'w', encoding='utf-8', newline='') as f:
