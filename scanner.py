@@ -48,7 +48,8 @@
 ★ 黑名单制度（黑名单极速跳过）：
   新增 blacklist_ips.txt (全局) 和 blacklist_shardN.txt (分片局部)。
   在 full 阶段中，单 IP 触发 300 秒熔断，或开放端口超过 1000 个（判定为蜜罐），直接将 IP 写入分片局部黑名单文件。
-  worker 拿 IP 前先查全局 + 局部黑名单，命中直接秒退，连探针都不跑。
+  ★ 黑名单检查仅在 full 阶段生效（common / revalidate / proxy 阶段端口少、熔断快，无需黑名单）。
+  ★ 黑名单写入也仅在 full 阶段发生，其余阶段从不写黑名单。
 ★ 彻底分离线程池与动态扩容收尾：
   - port_pool：2000 并发，只跑 tcp_check，速度起飞。
   - verify_pool：日常 150 并发（峰值 450 个 curl），防止 4 核机器被数千个 curl 进程撑爆内存假死。
@@ -76,9 +77,12 @@
 ★ 黑名单注释污染修复（核心）：
   load_ip_set 读取黑名单时跳过以 @ 或 # 开头的注释行，防止「@ 生成时间」等注释被当成 IP 反复读写，
   导致 blacklist_ips.txt 急剧膨胀且包含无效数据。merge_shards.py 的 build_global_blacklist 同步修复。
-★ 黑名单写入加固（本次新增）：
+★ 黑名单写入加固：
   add_to_blacklist 在追加写入前，强制用 ipaddress.IPv4Address 校验合法性。
   任何非合法 IPv4 字符串一律拒绝写入并打印告警。彻底杜绝任何脏数据进入 blacklist_shardN.txt。
+★ 黑名单作用域收窄（本次新增）：
+  worker 开头的黑名单拦截加 if current_phase == 'full' 判断，仅 full 阶段查黑名单。
+  common / revalidate / proxy 阶段完全不查黑名单，靠 30~60 秒单 IP 熔断兜底即可。
 """
 
 import os
@@ -1126,14 +1130,16 @@ def main():
             ip_int, note = ip_at_position(p)
             ip = ip_int_to_str(ip_int)
 
-            # ★ 极速黑名单拦截：如果在黑名单里，直接跳过，连探针都不打
-            with blacklist_lock:
-                if ip in blacklist_set:
-                    with found_lock:
-                        processed_ips[0] += 1
-                        real_done = start_position + processed_ips[0]
-                        pct = real_done * 100.0 / total_ips if total_ips else 0
-                    continue
+            # ★ 极速黑名单拦截：仅 full 阶段生效
+            # common / revalidate / proxy 阶段不查黑名单（端口少、熔断快，无需黑名单）
+            if current_phase == 'full':
+                with blacklist_lock:
+                    if ip in blacklist_set:
+                        with found_lock:
+                            processed_ips[0] += 1
+                            real_done = start_position + processed_ips[0]
+                            pct = real_done * 100.0 / total_ips if total_ips else 0
+                        continue
 
             ip_has_open = False
             ip_has_proxy = False
