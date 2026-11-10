@@ -80,9 +80,16 @@
 ★ 黑名单写入加固：
   add_to_blacklist 在追加写入前，强制用 ipaddress.IPv4Address 校验合法性。
   任何非合法 IPv4 字符串一律拒绝写入并打印告警。彻底杜绝任何脏数据进入 blacklist_shardN.txt。
-★ 黑名单作用域收窄（本次新增）：
+★ 黑名单作用域收窄：
   worker 开头的黑名单拦截加 if current_phase == 'full' 判断，仅 full 阶段查黑名单。
   common / revalidate / proxy 阶段完全不查黑名单，靠 30~60 秒单 IP 熔断兜底即可。
+★ 批次黑洞联动熔断去重修复：
+  同一 IP 在 chunk 外层、chunk 内层、收网三个检查点可能重复触发 300 秒熔断，
+  导致 batch_full_timeout_count 虚高（日志出现"11 个 IP"但实际只有 8 个不同 IP）。
+  现在用 batch_full_timeout_ips 集合按 IP 去重：
+    - chunk 外层 / 内层超时 → _record_full_timeout(ip, True)，达到 8 个不同 IP 触发批次熔断
+    - 蜜罐秒踢 / 收网超时 → _record_full_timeout(ip, False)，只记录不触发批次熔断（保持原行为）
+  日志文案改为"X 个不同 IP 触发熔断"，与"10 个 IP 一批"对得上。
 """
 
 import os
@@ -1078,7 +1085,8 @@ def main():
     proxy_found_ips = set()
     proxy_missing_ips = set()
 
-    # ★ 记录当前批次有多少个 IP 触发了 300 秒熔断
+    # ★ 记录当前批次有多少个不同 IP 触发了熔断（按 IP 去重，防止同一 IP 在多检查点重复计数）
+    batch_full_timeout_ips = set()
     batch_full_timeout_count = [0]
 
     # ★ 黑名单加载与保存
@@ -1098,6 +1106,22 @@ def main():
             blacklist_set.add(ip_addr)
             with open(LOCAL_BLACKLIST_FILE, 'a', encoding='utf-8', newline='') as f:
                 f.write(ip_addr + CRLF)
+
+    def _record_full_timeout(ip_addr, trigger_batch_stop=True):
+        """★ 按 IP 去重记录 full 阶段熔断事件。
+        trigger_batch_stop=True: 不同 IP 数 >= 8 时触发批次黑洞联动熔断（chunk 内外层超时）。
+        trigger_batch_stop=False: 只记录，不触发批次熔断（蜜罐秒踢 / 收网超时）。
+        同一 IP 无论触发多少次检查点，set 里只算一次，彻底消灭日志里"11 个 IP"的虚高计数。
+        """
+        with found_lock:
+            if ip_addr in batch_full_timeout_ips:
+                return
+            batch_full_timeout_ips.add(ip_addr)
+            batch_full_timeout_count[0] = len(batch_full_timeout_ips)
+            if trigger_batch_stop and batch_full_timeout_count[0] >= 8:
+                log('[!] [full] 当前批次已有 %d 个不同 IP 触发熔断，可能遇到黑洞区，强制终止本批次！'
+                    % batch_full_timeout_count[0])
+                stop_flag[0] = True
 
     def next_position():
         with pos_lock:
@@ -1182,11 +1206,7 @@ def main():
                     # ★ 动态时间熔断：如果单 IP 耗时超过 300 秒(5分钟)，不管有没有代理，直接放弃
                     if time.time() - ip_start_time > MAX_IP_TIME_FULL:
                         log('[!] [full] IP %s 耗时超过 %d s (5分钟)，强制熔断放弃剩余端口！' % (ip, MAX_IP_TIME_FULL))
-                        with found_lock:
-                            batch_full_timeout_count[0] += 1
-                            if batch_full_timeout_count[0] >= 8:
-                                log('[!] [full] 当前批次已有 %d 个 IP 触发 300 秒熔断，可能遇到黑洞区，强制终止本批次！' % batch_full_timeout_count[0])
-                                stop_flag[0] = True
+                        _record_full_timeout(ip, trigger_batch_stop=True)
                         add_to_blacklist(ip)
                         break
 
@@ -1208,11 +1228,7 @@ def main():
                         # ★ 修复漏洞：在端口级别的循环里也要检查时间，防止被开放的端口太多卡死
                         if time.time() - ip_start_time > MAX_IP_TIME_FULL:
                             log('[!] [full] IP %s 耗时超过 %d s (5分钟)，强制熔断放弃剩余端口！' % (ip, MAX_IP_TIME_FULL))
-                            with found_lock:
-                                batch_full_timeout_count[0] += 1
-                                if batch_full_timeout_count[0] >= 8:
-                                    log('[!] [full] 当前批次已有 %d 个 IP 触发 300 秒熔断，可能遇到黑洞区，强制终止本批次！' % batch_full_timeout_count[0])
-                                    stop_flag[0] = True
+                            _record_full_timeout(ip, trigger_batch_stop=True)
                             add_to_blacklist(ip)
                             break
                             
@@ -1230,8 +1246,7 @@ def main():
                             # ★ 蜜罐秒踢：如果单 IP 开放端口超过 1000 个，直接放弃
                             if ip_open_count > MAX_OPEN_PORTS_FULL:
                                 log('[!] [full] IP %s 开放端口超过 %d 个，判定为防火墙/蜜罐，强制放弃！' % (ip, MAX_OPEN_PORTS_FULL))
-                                with found_lock:
-                                    batch_full_timeout_count[0] += 1
+                                _record_full_timeout(ip, trigger_batch_stop=False)
                                 add_to_blacklist(ip)
                                 break
                                 
@@ -1254,8 +1269,7 @@ def main():
                     # 收网时也要防卡死
                     if time.time() - ip_start_time > MAX_IP_TIME_FULL:
                         log('[!] [full] IP %s 耗时超过 %d s (5分钟)，强制终止验证！' % (ip, MAX_IP_TIME_FULL))
-                        with found_lock:
-                            batch_full_timeout_count[0] += 1
+                        _record_full_timeout(ip, trigger_batch_stop=False)
                         add_to_blacklist(ip)
                         break
                         
