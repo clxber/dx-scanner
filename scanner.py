@@ -74,8 +74,11 @@
   把 common 阶段的进度日志里的"代理IP"去掉了（因为收尾前必为0），换成展示"待验证任务"。
   同时为收尾阶段增加了每处理 5000 个任务的进度日志。
 ★ 黑名单注释污染修复（核心）：
-  load_ip_set 读取黑名单时跳过以 @ 或 # 开头的注释行，防止 @ 生成时间 等注释被当成 IP 反复读写，
+  load_ip_set 读取黑名单时跳过以 @ 或 # 开头的注释行，防止「@ 生成时间」等注释被当成 IP 反复读写，
   导致 blacklist_ips.txt 急剧膨胀且包含无效数据。merge_shards.py 的 build_global_blacklist 同步修复。
+★ 黑名单写入加固（本次新增）：
+  add_to_blacklist 在追加写入前，强制用 ipaddress.IPv4Address 校验合法性。
+  任何非合法 IPv4 字符串一律拒绝写入并打印告警。彻底杜绝任何脏数据进入 blacklist_shardN.txt。
 """
 
 import os
@@ -1081,6 +1084,10 @@ def main():
     log('历史黑名单 IP 累积: %d 个' % len(blacklist_set))
 
     def add_to_blacklist(ip_addr):
+        # ★ 防御性校验：只接受合法 IPv4，任何非 IP 字符串一律拒绝，杜绝污染源
+        if not _valid_ipv4(ip_addr):
+            log('[!] add_to_blacklist 拒绝非法 IP: %r' % ip_addr)
+            return
         with blacklist_lock:
             if ip_addr in blacklist_set:
                 return
