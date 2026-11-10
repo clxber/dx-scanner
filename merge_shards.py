@@ -15,6 +15,7 @@
   - ★ 物理归零：当从头开始（游标 0）合并时，抛弃旧的 alive_ips.txt，彻底重头统计
   - ★ 游标封顶：推进游标时，绝不超越实际总 IP 数（如 65536），防止出现 90000 这种虚高数字
   - ★ Bug 修复：scan_finished.flag 判定加入阈值对比，未达 PROXY_THRESHOLD 时即使有代理也切 full 兜底。
+  - ★ 黑名单合并：将各个分片的 local 黑名单（blacklist_shardN.txt）合并去重到全局黑名单（blacklist_ips.txt）中。
 """
 
 import os
@@ -37,6 +38,7 @@ PHASE_FILE = 'phase.json'
 OUTPUT_FILE = 'working_proxies.txt'
 ALIVE_IPS_FILE = 'alive_ips.txt'
 ALIVE_IP_RANGES_FILE = 'alive_ip_ranges.txt'
+GLOBAL_BLACKLIST_FILE = 'blacklist_ips.txt'
 CRLF = '\r\n'
 
 CURSOR_FILE = 'scan_cursor.json'
@@ -67,7 +69,6 @@ def save_json(path, data):
 def move_cursor(batch_size, total_ips):
     state = load_json(CURSOR_FILE) or {'offset': 0}
     new_offset = state['offset'] + batch_size
-    # ★ 核心修复：如果推进后超过总 IP 数，直接封顶在总 IP 数
     if total_ips > 0 and new_offset > total_ips:
         new_offset = total_ips
     
@@ -126,6 +127,7 @@ def cleanup_shard_files():
         'working_proxies_shard*.txt',
         'full_cursor_shard*.json',
         'full_alive_shard*.txt',
+        'blacklist_shard*.txt',
     ]
     removed = 0
     for pat in patterns:
@@ -296,6 +298,38 @@ def build_alive_ip_ranges(ignore_old=False):
     log('已生成 %s: 累计 %d 个段有存活 IP' % (ALIVE_IP_RANGES_FILE, len(items)))
 
 
+def build_global_blacklist():
+    blacklist_set = set()
+    
+    # 先读取旧的全局黑名单
+    if os.path.exists(GLOBAL_BLACKLIST_FILE):
+        with open(GLOBAL_BLACKLIST_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    blacklist_set.add(line)
+
+    # 再合并各个分片的局部黑名单
+    for i in range(SHARD_TOTAL):
+        path = 'blacklist_shard%d.txt' % i
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        blacklist_set.add(line)
+
+    with open(GLOBAL_BLACKLIST_FILE, 'w', encoding='utf-8', newline='') as f:
+        f.write('@ 全局黑名单 IP（蜜罐/黑洞），永久跳过' + CRLF)
+        f.write('@ 生成时间: %s' % time.strftime('%Y-%m-%d %H:%M:%S') + CRLF)
+        f.write('@ 总数: %d' % len(blacklist_set) + CRLF)
+        f.write('@' + '-' * 58 + CRLF)
+        for ip in sorted(blacklist_set):
+            f.write(ip + CRLF)
+
+    log('已生成并更新全局黑名单 %s: 累计 %d 个 IP' % (GLOBAL_BLACKLIST_FILE, len(blacklist_set)))
+
+
 def handle_verify_existing(phase_state):
     all_done = True
     missing_shards = []
@@ -359,6 +393,12 @@ def handle_verify_existing(phase_state):
 
 
 def main():
+    # 合并黑名单（无论哪个阶段，先合并一下黑名单确保数据不丢）
+    try:
+        build_global_blacklist()
+    except Exception as e:
+        log('[!] 合并全局黑名单失败: %s' % e)
+
     if os.path.exists(FINISHED_FLAG):
         log('=' * 60)
         log('✅ 检测到 scan_finished.flag，全量 IP 的 common 阶段已全部扫描完毕...')
@@ -373,7 +413,6 @@ def main():
         
         current_count = count_file_lines(OUTPUT_FILE)
         
-        # ★ 核心修复：判断是否达到 PROXY_THRESHOLD 阈值
         if current_count >= PROXY_THRESHOLD:
             log('全量扫描共找到 %d 个有效代理（达到阈值 %d），已满足需求，直接收官！' % (current_count, PROXY_THRESHOLD))
             save_json(CURSOR_FILE, {'offset': 0})
