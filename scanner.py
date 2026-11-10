@@ -73,6 +73,9 @@
 ★ 进度日志优化：
   把 common 阶段的进度日志里的"代理IP"去掉了（因为收尾前必为0），换成展示"待验证任务"。
   同时为收尾阶段增加了每处理 5000 个任务的进度日志。
+★ 黑名单注释污染修复（核心）：
+  load_ip_set 读取黑名单时跳过以 @ 或 # 开头的注释行，防止 @ 生成时间 等注释被当成 IP 反复读写，
+  导致 blacklist_ips.txt 急剧膨胀且包含无效数据。merge_shards.py 的 build_global_blacklist 同步修复。
 """
 
 import os
@@ -383,7 +386,7 @@ def load_proxy_list(path):
 
 
 def load_ip_set(path):
-    """仅用于不关心顺序的场景，比如判断某个 IP 是否在集合内"""
+    """★ 核心修复：跳过以 @ 或 # 开头的注释行，防止被当成 IP 读取"""
     s = set()
     if not os.path.exists(path):
         return s
@@ -391,7 +394,7 @@ def load_ip_set(path):
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
                 line = line.strip()
-                if line:
+                if line and not line.startswith('@') and not line.startswith('#'):
                     s.add(line)
     except Exception:
         pass
