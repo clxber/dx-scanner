@@ -17,8 +17,11 @@
   - ★ Bug 修复：scan_finished.flag 判定加入阈值对比，未达 PROXY_THRESHOLD 时即使有代理也切 full 兜底。
   - ★ 黑名单合并：将各个分片的 local 黑名单（blacklist_shardN.txt）合并去重到全局黑名单（blacklist_ips.txt）中。
   - ★ 黑名单注释污染修复（核心）：读取旧全局黑名单和分片黑名单时，跳过以 @ 或 # 开头的注释行，
-    防止「@ 生成时间」「@ 总数」等注释被当成 IP 反复读入 blacklist_set 并重新写回，
-    导致 blacklist_ips.txt 急剧膨胀且包含无效数据。与 scanner.py 的 load_ip_set 修复保持同步。
+    并且强制用 ipaddress.IPv4Address 校验合法性，防止「@ 生成时间」「@ 总数」等注释被当成 IP 反复读入
+    blacklist_set 并重新写回，导致 blacklist_ips.txt 急剧膨胀且包含无效数据。
+  - ★ 黑名单写入彻底净化（本次新增）：写入全局黑名单时，**不再写任何头部注释**，只写纯 IP 行。
+    即使旧文件被污染，下一轮运行也会被自动净化为纯 IP 文件。与 scanner.py 的 load_ip_set /
+    add_to_blacklist 双重校验保持同步。
 """
 
 import os
@@ -209,6 +212,15 @@ def _parse_ip_range(line):
     return None
 
 
+def _is_valid_ipv4_str(s):
+    """★ 黑名单专用：严格校验是否为合法 IPv4 字符串"""
+    try:
+        ipaddress.IPv4Address(s)
+        return True
+    except Exception:
+        return False
+
+
 def build_alive_ip_ranges(ignore_old=False):
     alive_ints = set()
 
@@ -302,35 +314,44 @@ def build_alive_ip_ranges(ignore_old=False):
 
 
 def build_global_blacklist():
+    """
+    ★ 黑名单合并终极净化版：
+      1. 读取旧全局黑名单时，跳过 @ / # 注释行 + IPv4 合法性双重校验
+      2. 合并分片黑名单时，同样跳过注释 + IPv4 校验
+      3. 写入时**不写任何头部注释**，只写纯 IP 行，彻底杜绝污染源
+    """
     blacklist_set = set()
-    
-    # 先读取旧的全局黑名单（★ 核心修复：跳过以 @ 或 # 开头的注释行）
+
+    # ---- 读取旧全局黑名单（双保险：过滤注释 + IPv4 校验） ----
     if os.path.exists(GLOBAL_BLACKLIST_FILE):
         with open(GLOBAL_BLACKLIST_FILE, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
                 line = line.strip()
-                if line and not line.startswith('@') and not line.startswith('#'):
+                if not line or line.startswith('@') or line.startswith('#'):
+                    continue
+                if _is_valid_ipv4_str(line):
                     blacklist_set.add(line)
 
-    # 再合并各个分片的局部黑名单（同样跳过注释行）
+    # ---- 合并各分片局部黑名单（双保险） ----
     for i in range(SHARD_TOTAL):
         path = 'blacklist_shard%d.txt' % i
-        if os.path.exists(path):
-            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('@') and not line.startswith('#'):
-                        blacklist_set.add(line)
+        if not os.path.exists(path):
+            continue
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('@') or line.startswith('#'):
+                    continue
+                if _is_valid_ipv4_str(line):
+                    blacklist_set.add(line)
 
+    # ---- 写入：纯 IP 行，无任何注释 ----
     with open(GLOBAL_BLACKLIST_FILE, 'w', encoding='utf-8', newline='') as f:
-        f.write('@ 全局黑名单 IP（蜜罐/黑洞），永久跳过' + CRLF)
-        f.write('@ 生成时间: %s' % time.strftime('%Y-%m-%d %H:%M:%S') + CRLF)
-        f.write('@ 总数: %d' % len(blacklist_set) + CRLF)
-        f.write('@' + '-' * 58 + CRLF)
         for ip in sorted(blacklist_set):
             f.write(ip + CRLF)
 
-    log('已生成并更新全局黑名单 %s: 累计 %d 个 IP' % (GLOBAL_BLACKLIST_FILE, len(blacklist_set)))
+    log('已生成并更新全局黑名单 %s: 累计 %d 个 IP（纯净格式，无头部注释）'
+        % (GLOBAL_BLACKLIST_FILE, len(blacklist_set)))
 
 
 def handle_verify_existing(phase_state):
