@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-高校代理扫描器 —— 五阶段 + 分片 + 断点续跑
+高校代理扫描器 —— 五阶段 + 分片 + 断点续跑 + 黑名单极速跳过
 
 阶段 1 verify_existing：验证已有代理（只有分片 0 干活）
 阶段 2 common         ：12 探针 + 191 代理（TCP 探活，IP 级短路）+ 顺便代理验证
@@ -31,7 +31,7 @@
 ★ 文案优化：将新切片日志精准区分为"批次扫描"，消除进度清零的误解
 ★ 视觉归零：当全局游标为 0 时，日志展示的历史累积 IP 强制归零，契合"重头开始"的直觉
 ★ 性能重构：full 阶段采用滑动窗口分批提交（每次 5000 个端口），既压满 2000 并发，又防止内存/GIL假死
-★ 战利品入库：将中科大实测有效端口 3123 及清华实测 4780, 59532, 11888, 12001, 33811, 50179, 12000 加入常用代理端口池
+★ 战利品入库：将中科大实测有效端口 3123 及清华实测 4780, 59532, 11888, 12001, 33811, 50179, 12000 加入代理端口池
 ★ 神来一笔：full 开拔前置全量探活 —— 进入 full 阶段时一次性用 1000 并发把上游全部待深扫 IP 的
   195 个常用端口探一遍，几秒钟剔除死 IP，生成纯净的 full_alive_shardN.txt 存活名单，再用这份
   名单去跑 10 个一批的接力深扫，省下海量 GitHub Actions 接力轮次与运行额度。幂等：文件存在即复用。
@@ -45,6 +45,10 @@
   - proxy 阶段：串行 3 协议，每个端口 40 秒超时。单 IP 总耗时超 60 秒熔断。
   - full 阶段：单 IP 超 300 秒直接熔断（取消“已有代理则不熔断”的免死金牌）。
   - full 阶段批次熔断：如果当前 10 个 IP 的批次里，有 8 个都吃满 300 秒熔断，说明遇到黑洞区，直接终止本批次，保留游标下一轮再战。
+★ 黑名单制度（黑名单极速跳过）：
+  新增 blacklist_ips.txt (全局) 和 blacklist_shardN.txt (分片局部)。
+  在 full 阶段中，单 IP 触发 300 秒熔断，或开放端口超过 1000 个（判定为蜜罐），直接将 IP 写入分片局部黑名单文件。
+  worker 拿 IP 前先查全局 + 局部黑名单，命中直接秒退，连探针都不跑。
 ★ 彻底分离线程池与动态扩容收尾：
   - port_pool：2000 并发，只跑 tcp_check，速度起飞。
   - verify_pool：日常 150 并发（峰值 450 个 curl），防止 4 核机器被数千个 curl 进程撑爆内存假死。
@@ -93,6 +97,7 @@ TOTAL_MAX_REQUESTS = int(os.environ.get('TOTAL_MAX_REQUESTS', 5500000))
 
 CURSOR_FILE = 'scan_cursor.json'
 FINISHED_FLAG = 'scan_finished.flag'
+GLOBAL_BLACKLIST_FILE = 'blacklist_ips.txt'
 
 # ============ 配置 ============
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -185,6 +190,7 @@ PHASE_FILE = 'phase.json'
 RUNNER_TEMP = os.environ.get('RUNNER_TEMP', '/tmp')
 
 if SHARD_TOTAL > 1:
+    LOCAL_BLACKLIST_FILE = 'blacklist_shard%d.txt' % SHARD_INDEX
     STATE_FILE = 'progress_shard%d.json' % SHARD_INDEX
     OUTPUT_FILE = 'working_proxies_shard%d.txt' % SHARD_INDEX
     OPEN_IPS_FILE = 'open_ips_shard%d.txt' % SHARD_INDEX
@@ -194,6 +200,7 @@ if SHARD_TOTAL > 1:
     FULL_CURSOR_FILE = 'full_cursor_shard%d.json' % SHARD_INDEX
     FULL_ALIVE_FILE = 'full_alive_shard%d.txt' % SHARD_INDEX
 else:
+    LOCAL_BLACKLIST_FILE = GLOBAL_BLACKLIST_FILE
     STATE_FILE = 'progress.json'
     OUTPUT_FILE = 'working_proxies.txt'
     OPEN_IPS_FILE = 'open_ips.txt'
@@ -295,15 +302,12 @@ def get_ips_slice(ranges, start_idx, end_idx):
     current_idx = 0
     for s, e, note in ranges:
         count = e - s + 1
-        # 如果当前范围在目标切片结束之后，直接跳出
         if current_idx >= end_idx:
             break
-        # 如果当前范围在目标切片开始之前，直接跳过
         if current_idx + count <= start_idx:
             current_idx += count
             continue
         
-        # 计算重叠部分
         overlap_start = max(s, s + (start_idx - current_idx))
         overlap_end = min(e, s + (end_idx - current_idx - 1))
         
@@ -1067,6 +1071,20 @@ def main():
     # ★ 记录当前批次有多少个 IP 触发了 300 秒熔断
     batch_full_timeout_count = [0]
 
+    # ★ 黑名单加载与保存
+    blacklist_lock = threading.Lock()
+    blacklist_set = load_ip_set(GLOBAL_BLACKLIST_FILE) # 加载全局
+    blacklist_set.update(load_ip_set(LOCAL_BLACKLIST_FILE)) # 加载本分片局部
+    log('历史黑名单 IP 累积: %d 个' % len(blacklist_set))
+
+    def add_to_blacklist(ip_addr):
+        with blacklist_lock:
+            if ip_addr in blacklist_set:
+                return
+            blacklist_set.add(ip_addr)
+            with open(LOCAL_BLACKLIST_FILE, 'a', encoding='utf-8', newline='') as f:
+                f.write(ip_addr + CRLF)
+
     def next_position():
         with pos_lock:
             if current_pos[0] >= total_ips:
@@ -1097,6 +1115,15 @@ def main():
                 return
             ip_int, note = ip_at_position(p)
             ip = ip_int_to_str(ip_int)
+
+            # ★ 极速黑名单拦截：如果在黑名单里，直接跳过，连探针都不打
+            with blacklist_lock:
+                if ip in blacklist_set:
+                    with found_lock:
+                        processed_ips[0] += 1
+                        real_done = start_position + processed_ips[0]
+                        pct = real_done * 100.0 / total_ips if total_ips else 0
+                    continue
 
             ip_has_open = False
             ip_has_proxy = False
@@ -1144,6 +1171,7 @@ def main():
                             if batch_full_timeout_count[0] >= 8:
                                 log('[!] [full] 当前批次已有 %d 个 IP 触发 300 秒熔断，可能遇到黑洞区，强制终止本批次！' % batch_full_timeout_count[0])
                                 stop_flag[0] = True
+                        add_to_blacklist(ip)
                         break
 
                     chunk_ports = PORTS[i:i+chunk_size]
@@ -1169,6 +1197,7 @@ def main():
                                 if batch_full_timeout_count[0] >= 8:
                                     log('[!] [full] 当前批次已有 %d 个 IP 触发 300 秒熔断，可能遇到黑洞区，强制终止本批次！' % batch_full_timeout_count[0])
                                     stop_flag[0] = True
+                            add_to_blacklist(ip)
                             break
                             
                         try:
@@ -1187,6 +1216,7 @@ def main():
                                 log('[!] [full] IP %s 开放端口超过 %d 个，判定为防火墙/蜜罐，强制放弃！' % (ip, MAX_OPEN_PORTS_FULL))
                                 with found_lock:
                                     batch_full_timeout_count[0] += 1
+                                add_to_blacklist(ip)
                                 break
                                 
                             # 提交给 verify_pool 验证，不在这里死等
@@ -1210,6 +1240,7 @@ def main():
                         log('[!] [full] IP %s 耗时超过 %d s (5分钟)，强制终止验证！' % (ip, MAX_IP_TIME_FULL))
                         with found_lock:
                             batch_full_timeout_count[0] += 1
+                        add_to_blacklist(ip)
                         break
                         
                     try:
