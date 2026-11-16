@@ -1,14 +1,14 @@
 {
   "position": 10,
-  "done": 10787,
+  "done": 11294,
   "total_ips": 10,
   "phase": "full",
   "shard_index": 5,
   "shard_total": 8,
-  "started_at": "2026-11-16 18:45:30",
+  "started_at": "2026-11-16 18:58:00",
   "completed": true,
   "session": 1,
-  "f_offset": 330,
+  "f_offset": 340,
   "all_upstream_ips_len": 1045,
-  "completed_at": "2026-11-16 18:48:23"
+  "completed_at": "2026-11-16 19:01:00"
 }
